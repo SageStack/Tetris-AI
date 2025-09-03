@@ -16,7 +16,8 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributions import Categorical
 
-from tetris import make_vec_env
+import argparse
+from tetris import make_vec_env, TetrisEnvWrapper, BOARD_W, BOARD_H
 from actor_critic import build_default_model
 
 
@@ -72,8 +73,36 @@ def _print_setup_summary(action_space_n: int) -> None:
 
 
 if __name__ == "__main__":
+    # CLI args
+    parser = argparse.ArgumentParser(description="Train PPO on Tetris")
+    parser.add_argument("--render", action="store_true", help="Enable realtime rendering via observer env")
+    parser.add_argument("--tile", type=int, default=30, help="Tile size for rendering (pixels)")
+    args = parser.parse_args()
+
     # Vectorized Environment (multiprocessing). Keep under __main__ for 'spawn'.
     vec_env = make_vec_env(num_envs=NUM_ENVS, backend="sync")
+
+    # Optional: observer environment for visualization in main process
+    observer_env = None
+    screen = None
+    clock = None
+    render_enabled = bool(args.render)
+    tile_size = int(args.tile)
+    if render_enabled:
+        try:
+            import pygame  # type: ignore
+        except Exception as e:
+            print(f"Render disabled: pygame import failed: {e}")
+            render_enabled = False
+        if render_enabled:
+            observer_env = TetrisEnvWrapper()
+            # Pygame init
+            pygame.init()
+            W = 20 + BOARD_W * tile_size + 20 + 150
+            H = 20 + BOARD_H * tile_size + 20
+            screen = pygame.display.set_mode((W, H))
+            pygame.display.set_caption("Tetris PPO - Observer")
+            clock = pygame.time.Clock()
 
     # Model & optimizer
     model = build_default_model(vec_env.action_space_n).to(device)
@@ -226,6 +255,10 @@ if __name__ == "__main__":
     obs_list = vec_env.reset()
     spatial_tensor, flat_tensor = batch_obs_to_tensors(obs_list, device)
 
+    # Observer initial reset
+    if render_enabled and observer_env is not None:
+        observer_obs = observer_env.reset()
+
     # Shapes for buffer
     spatial_shape = tuple(spatial_tensor.shape[1:])  # (2, 20, 10)
     flat_dim = int(flat_tensor.shape[1])             # 43
@@ -243,28 +276,68 @@ if __name__ == "__main__":
         buffer.clear()
         with torch.no_grad():
             for t in range(N_STEPS):
-                # Forward pass
-                logits, values = model((spatial_tensor, flat_tensor))
+                # Build combined batch including observer (if enabled)
+                if render_enabled and observer_env is not None:
+                    # Convert observer obs to tensors and append as batch=1
+                    obs_spatial, obs_flat = observer_obs
+                    obs_spatial_t = torch.as_tensor(obs_spatial, device=device, dtype=torch.float32).unsqueeze(0)
+                    obs_flat_t = torch.as_tensor(obs_flat, device=device, dtype=torch.float32).unsqueeze(0)
+                    spatial_in = torch.cat([spatial_tensor, obs_spatial_t], dim=0)
+                    flat_in = torch.cat([flat_tensor, obs_flat_t], dim=0)
+                else:
+                    spatial_in, flat_in = spatial_tensor, flat_tensor
 
-                # Mask invalid actions
-                mask_list = vec_env.valid_action_masks()  # List[List[int]] (N, A)
-                mask = torch.tensor(mask_list, device=device, dtype=torch.bool)
-                logits = logits.masked_fill(~mask, -torch.inf)
+                # Forward pass on combined batch
+                logits_all, values_all = model((spatial_in, flat_in))
 
-                # Sample actions
-                dist = Categorical(logits=logits)
-                actions = dist.sample()                # (N,)
-                log_probs = dist.log_prob(actions)     # (N,)
+                # Mask invalid actions (vec + optional observer)
+                mask_vec = vec_env.valid_action_masks()  # List[List[int]] (N, A)
+                if render_enabled and observer_env is not None:
+                    mask_obs = observer_env.valid_action_mask()
+                    mask_combined = mask_vec + [mask_obs]
+                else:
+                    mask_combined = mask_vec
+                mask = torch.tensor(mask_combined, device=device, dtype=torch.bool)
+                logits_all = logits_all.masked_fill(~mask, -torch.inf)
 
-                # Step environments
-                next_obs_list, rewards_np, dones_np, infos_list = vec_env.step(actions.detach().cpu().tolist())
+                # Sample actions over combined
+                dist_all = Categorical(logits=logits_all)
+                actions_all = dist_all.sample()            # (N [+ 1],)
+                log_probs_all = dist_all.log_prob(actions_all)
+
+                # Slice vec vs observer
+                actions_vec = actions_all[:NUM_ENVS]
+                log_probs_vec = log_probs_all[:NUM_ENVS]
+                values_vec = values_all[:NUM_ENVS]
+
+                # Step training environments
+                next_obs_list, rewards_np, dones_np, infos_list = vec_env.step(actions_vec.detach().cpu().tolist())
+
+                # Step observer environment and render (do not store/learn from it)
+                if render_enabled and observer_env is not None:
+                    import pygame  # type: ignore
+                    action_obs = int(actions_all[-1].item())
+                    observer_obs, observer_reward, observer_done, observer_info = observer_env.step(action_obs)
+                    # Draw
+                    if screen is not None:
+                        observer_env.render(screen, tile=tile_size)
+                        # process events so the window stays responsive
+                        for event in pygame.event.get():
+                            if event.type == pygame.QUIT:
+                                render_enabled = False
+                        pygame.display.flip()
+                        if clock is not None:
+                            clock.tick(30)
+                    # Reset observer episode if done
+                    if observer_done:
+                        observer_obs = observer_env.reset()
 
                 # Convert rewards/dones
                 rewards = torch.tensor(rewards_np, device=device, dtype=torch.float32)
                 dones = torch.tensor(dones_np, device=device, dtype=torch.float32)
 
                 # Store step in buffer
-                buffer.add(spatial_tensor, flat_tensor, actions, log_probs, rewards, dones, values)
+                buffer.add(spatial_tensor, flat_tensor, actions_vec, log_probs_vec, rewards, dones, values_vec)
 
                 # Logging trackers
                 ep_returns += rewards.double().cpu()
@@ -412,4 +485,11 @@ if __name__ == "__main__":
 
     # Cleanup
     vec_env.close()
+    # Cleanup rendering
+    try:
+        if render_enabled:
+            import pygame  # type: ignore
+            pygame.quit()
+    except Exception:
+        pass
     writer.close()
