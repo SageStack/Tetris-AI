@@ -274,8 +274,8 @@ if __name__ == "__main__":
     # Indicates final rendering state after training completes
     training_is_complete = False
 
-    # Per-env episodic trackers for logging
-    ep_returns = torch.zeros(NUM_ENVS, dtype=torch.float64)
+    # Per-env episodic trackers for logging (keep float32 for MPS compatibility)
+    ep_returns = torch.zeros(NUM_ENVS, dtype=torch.float32)
     ep_lengths = torch.zeros(NUM_ENVS, dtype=torch.int64)
 
     while global_step_counter < TOTAL_TIMESTEPS:
@@ -347,8 +347,8 @@ if __name__ == "__main__":
                 # Store step in buffer
                 buffer.add(spatial_tensor, flat_tensor, actions_vec, log_probs_vec, rewards, dones, values_vec)
 
-                # Logging trackers
-                ep_returns += rewards.double().cpu()
+                # Logging trackers (avoid float64 on MPS; accumulate on CPU float32)
+                ep_returns += rewards.detach().cpu().to(torch.float32)
                 ep_lengths += 1
 
                 # Reset envs that are done; log episode info
