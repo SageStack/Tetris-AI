@@ -772,6 +772,38 @@ class TetrisEnvWrapper:
 
         # Execute low-level sequence: rotate -> move -> hard drop
         pre_obs = self.env.get_observation()
+        pre_board = pre_obs["board"]
+
+        # Utilities to compute board metrics for shaping
+        def _count_holes(board) -> int:
+            holes = 0
+            # iterate columns; count empty cells below the first filled cell
+            for x in range(BOARD_W):
+                seen_block = False
+                for y in range(BOARD_H):
+                    val = board[y][x]
+                    if val:
+                        seen_block = True
+                    else:
+                        if seen_block:
+                            holes += 1
+            return holes
+
+        def _max_stack_height(board) -> int:
+            max_h = 0
+            for x in range(BOARD_W):
+                col_h = 0
+                for y in range(BOARD_H):
+                    if board[y][x]:
+                        # height measured from bottom in blocks
+                        col_h = BOARD_H - y
+                        break
+                if col_h > max_h:
+                    max_h = col_h
+            return max_h
+
+        pre_holes = _count_holes(pre_board)
+        pre_max_h = _max_stack_height(pre_board)
         total_reward = 0.0
         locked = False
 
@@ -782,6 +814,20 @@ class TetrisEnvWrapper:
         locked = info_last.get("locked", False)
 
         post_obs = self.env.get_observation()
+        post_board = post_obs["board"]
+
+        # Reward shaping applied only when a piece locks
+        if locked:
+            post_holes = _count_holes(post_board)
+            post_max_h = _max_stack_height(post_board)
+
+            # Penalty if holes increased (flat -0.2)
+            if post_holes > pre_holes:
+                total_reward += -0.2
+
+            # Penalty for increasing maximum stack height (-0.1 per block)
+            if post_max_h > pre_max_h:
+                total_reward += -0.1 * float(post_max_h - pre_max_h)
         info = {
             "locked": locked,
             "lines_cleared": info_last.get("lines_cleared", 0),

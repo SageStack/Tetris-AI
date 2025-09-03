@@ -36,14 +36,14 @@ TOTAL_TIMESTEPS: int = 10_000_000
 N_STEPS: int = 2048            # rollout length per env before update
 PPO_EPOCHS: int = 10           # optimization epochs per update
 BATCH_SIZE: int = 64           # minibatch size
-LEARNING_RATE: float = 3e-4
+LEARNING_RATE: float = 1e-4
 GAMMA: float = 0.99
 GAE_LAMBDA: float = 0.95
 CLIP_COEF: float = 0.2
 
 # Loss weighting
 VF_COEF: float = 0.5           # value function loss weight
-ENT_COEF: float = 0.01         # entropy bonus weight
+ENT_COEF: float = 0.001        # entropy bonus weight
 
 
 # -----------------------------
