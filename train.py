@@ -127,8 +127,18 @@ if __name__ == "__main__":
             W = 20 + BOARD_W * tile_size + 20 + 150
             H = 20 + BOARD_H * tile_size + 20
             screen = pygame.display.set_mode((W, H))
-            pygame.display.set_caption("Tetris PPO - Observer")
+            # Show run id in the window title
+            try:
+                run_id_title = os.path.basename(run_dir)
+            except Exception:
+                run_id_title = "run"
+            pygame.display.set_caption(f"Tetris PPO - Observer - {run_id_title}")
             clock = pygame.time.Clock()
+            # Pre-create a small font for lightweight HUD text
+            try:
+                hud_font = pygame.font.SysFont("consolas", 18)
+            except Exception:
+                hud_font = pygame.font.Font(None, 18)
 
     # Model & optimizer
     model = build_default_model(vec_env.action_space_n).to(device)
@@ -375,6 +385,14 @@ if __name__ == "__main__":
                     # Draw
                     if screen is not None:
                         observer_env.render(screen, tile=tile_size)
+                        # Lightweight HUD: show current run id in the top-left
+                        try:
+                            run_id = os.path.basename(run_dir)
+                        except Exception:
+                            run_id = "run"
+                        if 'hud_font' in locals() and hud_font is not None:
+                            text_surface = hud_font.render(f"Run: {run_id}", True, (230, 230, 230))
+                            screen.blit(text_surface, (10, 6))
                         # process events so the window stays responsive
                         for event in pygame.event.get():
                             if event.type == pygame.QUIT:
