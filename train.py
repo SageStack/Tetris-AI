@@ -28,24 +28,22 @@ from actor_critic import build_default_model
 # Hyperparameters
 # -----------------------------
 
-# Environment
-# Explorer experiment: increase parallel envs for diverse experience
-NUM_ENVS: int = 32
-TOTAL_TIMESTEPS: int = 10_000_000
+# Environment (defaults; can be overridden via CLI)
+NUM_ENVS: int = 16
+TOTAL_TIMESTEPS: int = 3_000_000
 
-# PPO core
-# Explorer experiment: larger rollout and bolder updates
-N_STEPS: int = 8192            # rollout length per env before update (increased)
-PPO_EPOCHS: int = 20           # optimization epochs per update (increased)
-BATCH_SIZE: int = 64           # minibatch size
-LEARNING_RATE: float = 2e-4    # learning rate (slightly increased)
-GAMMA: float = 0.99
+# PPO core (defaults; can be overridden via CLI)
+N_STEPS: int = 2048            # rollout length per env before update
+PPO_EPOCHS: int = 3            # optimization epochs per update
+BATCH_SIZE: int = 256          # minibatch size
+LEARNING_RATE: float = 2.5e-4  # learning rate
+GAMMA: float = 0.995
 GAE_LAMBDA: float = 0.95
 CLIP_COEF: float = 0.2
 
-# Loss weighting
+# Loss weighting (defaults; can be overridden via CLI)
 VF_COEF: float = 0.5           # value function loss weight
-ENT_COEF: float = 0.001        # entropy bonus weight
+ENT_COEF: float = 0.002        # entropy bonus weight
 
 
 # -----------------------------
@@ -88,6 +86,7 @@ if __name__ == "__main__":
     parser.add_argument("--render", action="store_true", help="Enable realtime rendering via observer env")
     parser.add_argument("--tile", type=int, default=30, help="Tile size for rendering (pixels)")
     parser.add_argument("--run-name", type=str, default=None, help="Base name for this run's logs under runs/")
+    parser.add_argument("--run-dir", type=str, default=None, help="Explicit directory for this run's logs")
     parser.add_argument(
         "--log-root",
         type=str,
@@ -95,20 +94,71 @@ if __name__ == "__main__":
         help="Root directory for TensorBoard logs (default: runs)",
     )
     parser.add_argument("--notes", type=str, default=None, help="Optional notes string to attach to the run")
+
+    # Hyperparameter overrides
+    parser.add_argument("--num-envs", type=int, default=None, help="Number of parallel environments")
+    parser.add_argument("--total-timesteps", type=int, default=None, help="Total environment steps to train")
+    parser.add_argument("--n-steps", type=int, default=None, help="Rollout length per env before PPO update")
+    parser.add_argument("--ppo-epochs", type=int, default=None, help="PPO optimization epochs per update")
+    parser.add_argument("--batch-size", type=int, default=None, help="Minibatch size for PPO updates")
+    parser.add_argument("--learning-rate", type=float, default=None, help="Optimizer learning rate")
+    parser.add_argument("--gamma", type=float, default=None, help="Discount factor")
+    parser.add_argument("--gae-lambda", type=float, default=None, help="GAE lambda")
+    parser.add_argument("--clip-coef", type=float, default=None, help="PPO clip coefficient")
+    parser.add_argument("--vf-coef", type=float, default=None, help="Value function loss coefficient")
+    parser.add_argument("--ent-coef", type=float, default=None, help="Entropy bonus coefficient")
+    parser.add_argument("--backend", type=str, choices=["sync", "subproc"], default="sync", help="Vec env backend")
+    parser.add_argument("--seed", type=int, default=None, help="Base seed for environment(s)")
     args = parser.parse_args()
 
-    # Build unique log directory for this run
-    base_name = args.run_name or "tetris-ppo"
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    short_uid = uuid.uuid4().hex[:6]
-    run_dir = os.path.join(args.log_root, f"{base_name}-{timestamp}-{short_uid}")
-    os.makedirs(run_dir, exist_ok=True)
+    # Apply hyperparameter overrides (if provided)
+    if args.num_envs is not None:
+        NUM_ENVS = int(args.num_envs)
+    if args.total_timesteps is not None:
+        TOTAL_TIMESTEPS = int(args.total_timesteps)
+    if args.n_steps is not None:
+        N_STEPS = int(args.n_steps)
+    if args.ppo_epochs is not None:
+        PPO_EPOCHS = int(args.ppo_epochs)
+    if args.batch_size is not None:
+        BATCH_SIZE = int(args.batch_size)
+    if args.learning_rate is not None:
+        LEARNING_RATE = float(args.learning_rate)
+    if args.gamma is not None:
+        GAMMA = float(args.gamma)
+    if args.gae_lambda is not None:
+        GAE_LAMBDA = float(args.gae_lambda)
+    if args.clip_coef is not None:
+        CLIP_COEF = float(args.clip_coef)
+    if args.vf_coef is not None:
+        VF_COEF = float(args.vf_coef)
+    if args.ent_coef is not None:
+        ENT_COEF = float(args.ent_coef)
+
+    # Build log directory for this run
+    if args.run_dir:
+        run_dir = args.run_dir
+        os.makedirs(run_dir, exist_ok=True)
+        base_name = os.path.basename(run_dir)
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        short_uid = uuid.uuid4().hex[:6]
+    else:
+        base_name = args.run_name or "tetris-ppo"
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        short_uid = uuid.uuid4().hex[:6]
+        run_dir = os.path.join(args.log_root, f"{base_name}-{timestamp}-{short_uid}")
+        os.makedirs(run_dir, exist_ok=True)
 
     # Create a TensorBoard writer using the explicit run directory
     writer: SummaryWriter = SummaryWriter(log_dir=run_dir)
 
     # Vectorized Environment (multiprocessing). Keep under __main__ for 'spawn'.
-    vec_env = make_vec_env(num_envs=NUM_ENVS, backend="sync")
+    # Prepare per-env seeds if provided
+    seeds = None
+    if args.seed is not None:
+        seeds = [int(args.seed) + i for i in range(NUM_ENVS)]
+
+    vec_env = make_vec_env(num_envs=NUM_ENVS, seeds=seeds, backend=args.backend)
 
     # Optional: observer environment for visualization in main process
     observer_env = None
@@ -335,6 +385,10 @@ if __name__ == "__main__":
     # Per-env episodic trackers for logging (keep float32 for MPS compatibility)
     ep_returns = torch.zeros(NUM_ENVS, dtype=torch.float32)
     ep_lengths = torch.zeros(NUM_ENVS, dtype=torch.int64)
+    # Aggregated episode returns for sweep metrics
+    all_episode_returns: list[float] = []
+    recent_returns_window: list[float] = []
+    recent_window_size = 100
 
     while global_step_counter < TOTAL_TIMESTEPS:
         # Rollout N_STEPS
@@ -426,6 +480,12 @@ if __name__ == "__main__":
                             writer.add_scalar("charts/episodic_length", ep_lengths[i].item(), global_step_counter)
                         except Exception:
                             pass
+                        # Track for metrics
+                        ret_val = float(ep_returns[i].item())
+                        all_episode_returns.append(ret_val)
+                        recent_returns_window.append(ret_val)
+                        if len(recent_returns_window) > recent_window_size:
+                            recent_returns_window.pop(0)
                         # Reset trackers for that env
                         ep_returns[i] = 0.0
                         ep_lengths[i] = 0
@@ -552,6 +612,13 @@ if __name__ == "__main__":
                 writer.add_scalar("loss/value", total_value_loss / minibatch_updates, global_step_counter)
                 writer.add_scalar("loss/entropy", total_entropy / minibatch_updates, global_step_counter)
                 writer.add_scalar("loss/total", total_loss / minibatch_updates, global_step_counter)
+                # Also log rolling episodic return mean if available
+                if recent_returns_window:
+                    writer.add_scalar(
+                        "charts/episodic_return_mean_last_100",
+                        sum(recent_returns_window) / max(1, len(recent_returns_window)),
+                        global_step_counter,
+                    )
             except Exception:
                 pass
 
@@ -563,6 +630,35 @@ if __name__ == "__main__":
     # Close training resources before showing final screen
     vec_env.close()
     writer.close()
+
+    # Persist simple metrics for sweeps
+    try:
+        metrics = {
+            "episodes": len(all_episode_returns),
+            "mean_return_overall": float(sum(all_episode_returns) / max(1, len(all_episode_returns))),
+            "max_return": float(max(all_episode_returns) if all_episode_returns else 0.0),
+            "mean_return_last_100": float(sum(recent_returns_window) / max(1, len(recent_returns_window))),
+            "config": {
+                "num_envs": NUM_ENVS,
+                "total_timesteps": TOTAL_TIMESTEPS,
+                "n_steps": N_STEPS,
+                "ppo_epochs": PPO_EPOCHS,
+                "batch_size": BATCH_SIZE,
+                "learning_rate": LEARNING_RATE,
+                "gamma": GAMMA,
+                "gae_lambda": GAE_LAMBDA,
+                "clip_coef": CLIP_COEF,
+                "vf_coef": VF_COEF,
+                "ent_coef": ENT_COEF,
+                "backend": args.backend,
+                "seed": args.seed,
+            },
+        }
+        with open(os.path.join(run_dir, "metrics.json"), "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2)
+        print(f"Final mean_return_last_100: {metrics['mean_return_last_100']}")
+    except Exception as e:
+        print(f"Warning: failed to write metrics.json: {e}")
 
     # Post-training completion screen
     if render_enabled and observer_env is not None and screen is not None:
