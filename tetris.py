@@ -589,6 +589,340 @@ def random_rollout(steps=200, seed=0, record_path="tetris_dataset.jsonl"):
     return total
 
 
+# -----------------------------
+# High-Level Action Wrapper
+# -----------------------------
+
+# We define a fixed-size high-level action space that maps an index to
+# a placement for the CURRENT piece: (rotation, target_x_of_4x4_top_left).
+# For fixed-size compatibility, we use the maximum number of placements
+# across any piece. For a 10x20 board this is typically ~34.
+
+from typing import NamedTuple
+
+
+class Placement(NamedTuple):
+    rot: int
+    x: int  # top-left of the 4x4 matrix on the board
+
+
+def _allowed_x_positions_for_mat(mat: List[List[int]]) -> List[int]:
+    # Identify occupied columns in the 4x4
+    cols = [c for c in range(4) if any(mat[r][c] for r in range(4))]
+    if not cols:
+        return list(range(BOARD_W))
+    min_c, max_c = min(cols), max(cols)
+    # top-left x must satisfy: 0 <= x + min_c and x + max_c <= BOARD_W-1
+    lo = -min_c
+    hi = (BOARD_W - 1) - max_c
+    return list(range(lo, hi + 1))
+
+
+def _compute_piece_placements() -> Dict[int, List[Placement]]:
+    by_piece: Dict[int, List[Placement]] = {}
+    for pid in range(1, 8):
+        placements: List[Placement] = []
+        for rot in range(4):
+            mat = PIECES[pid][rot]
+            for x in _allowed_x_positions_for_mat(mat):
+                placements.append(Placement(rot=rot, x=x))
+        by_piece[pid] = placements
+    return by_piece
+
+
+PLACEMENTS_BY_PIECE: Dict[int, List[Placement]] = _compute_piece_placements()
+MAX_ACTIONS_PER_PIECE: int = max(len(v) for v in PLACEMENTS_BY_PIECE.values())
+
+
+def preprocess_observation(obs: Dict[str, Any]) -> Tuple[Any, Any]:
+    # spatial planes: (2, 20, 10) -> [board_binary, current_piece_binary]
+    board = obs["board"]
+    if np is None:
+        # ensure list
+        board_list = board
+    else:
+        board_list = board.tolist() if isinstance(board, np.ndarray) else board
+
+    # plane 1: board locked cells as binary
+    if np is None:
+        plane_board = [[1 if cell != 0 else 0 for cell in row] for row in board_list]
+    else:
+        arr = np.array(board_list, dtype=np.int8)
+        plane_board = (arr != 0).astype(np.float32)
+
+    # plane 2: current falling piece
+    cur = obs["current"]
+    cur_x, cur_y = int(cur["x"]), int(cur["y"])
+    cur_mat = cur["matrix"]
+    if np is None:
+        plane_cur = [[0 for _ in range(BOARD_W)] for _ in range(BOARD_H)]
+        for r in range(4):
+            for c in range(4):
+                if cur_mat[r][c]:
+                    bx, by = cur_x + c, cur_y + r
+                    if 0 <= bx < BOARD_W and 0 <= by < BOARD_H:
+                        plane_cur[by][bx] = 1
+        spatial = [plane_board, plane_cur]
+    else:
+        plane_cur = np.zeros((BOARD_H, BOARD_W), dtype=np.float32)
+        for r in range(4):
+            for c in range(4):
+                if cur_mat[r][c]:
+                    bx, by = cur_x + c, cur_y + r
+                    if 0 <= bx < BOARD_W and 0 <= by < BOARD_H:
+                        plane_cur[by, bx] = 1.0
+        spatial = np.stack([
+            plane_board.astype(np.float32),
+            plane_cur.astype(np.float32)
+        ], axis=0)  # (2, H, W)
+
+    # flat vector: next queue (5x7 one-hot), hold (7 one-hot), can_hold (1)
+    next_q: List[int] = list(obs["next_queue"])[:5]
+    hold_id: int = int(obs["hold"]) if obs["hold"] is not None else 0
+    can_hold: bool = bool(obs["can_hold"])
+
+    if np is None:
+        next_oh = []
+        for pid in next_q:
+            row = [0]*7
+            if 1 <= pid <= 7:
+                row[pid-1] = 1
+            next_oh.extend(row)
+        hold_oh = [0]*7
+        if 1 <= hold_id <= 7:
+            hold_oh[hold_id-1] = 1
+        flat = next_oh + hold_oh + [1 if can_hold else 0]
+    else:
+        next_oh = np.zeros((5, 7), dtype=np.float32)
+        for i, pid in enumerate(next_q):
+            if 1 <= pid <= 7:
+                next_oh[i, pid-1] = 1.0
+        hold_oh = np.zeros((7,), dtype=np.float32)
+        if 1 <= hold_id <= 7:
+            hold_oh[hold_id-1] = 1.0
+        flat = np.concatenate([next_oh.reshape(-1), hold_oh, np.array([1.0 if can_hold else 0.0], dtype=np.float32)])
+
+    return spatial, flat
+
+
+class TetrisEnvWrapper:
+    """High-level action wrapper over TetrisEnv.
+
+    - Fixed action space size: MAX_ACTIONS_PER_PIECE
+    - Each action index is interpreted as a placement for the CURRENT piece,
+      by indexing into that piece's (rotation, x) list modulo its length.
+    - Executes low-level actions deterministically: rotate, move, hard drop.
+    """
+
+    def __init__(self, seed: Optional[int] = None, preprocess: bool = True, record_path: Optional[str] = None):
+        self.env = TetrisEnv(seed=seed, record_path=record_path)
+        self.preprocess = preprocess
+        self.action_space_n = MAX_ACTIONS_PER_PIECE
+
+    def reset(self, seed: Optional[int] = None):
+        obs = self.env.reset(seed=seed)
+        return preprocess_observation(obs) if self.preprocess else obs
+
+    def _map_action_to_current_piece(self, action_id: int) -> Placement:
+        # map a global index [0, MAX_ACTIONS_PER_PIECE) to current piece's placement via modulo
+        cur_pid = self.env.cur_id
+        plist = PLACEMENTS_BY_PIECE[cur_pid]
+        idx = int(action_id) % len(plist)
+        return plist[idx]
+
+    def _do_rotations(self, target_rot: int):
+        # rotate the minimal number of steps, preferring ccw if 3 steps cw
+        cur_rot = self.env.cur_rot
+        diff = (target_rot - cur_rot) % 4
+        if diff == 0:
+            return
+        if diff == 3:
+            self.env.step(3)  # rotate_ccw
+        else:
+            for _ in range(diff):
+                self.env.step(2)  # rotate_cw
+
+    def _move_horizontally(self, target_x: int):
+        # Move left/right toward target_x while possible
+        while self.env.cur_x != target_x:
+            if self.env.cur_x > target_x:
+                prev_x = self.env.cur_x
+                self.env.step(0)  # left
+                if self.env.cur_x == prev_x:
+                    break  # blocked
+            else:
+                prev_x = self.env.cur_x
+                self.env.step(1)  # right
+                if self.env.cur_x == prev_x:
+                    break  # blocked
+
+    def step(self, action_id: int):
+        if self.env.game_over:
+            obs = self.env.get_observation()
+            return (preprocess_observation(obs) if self.preprocess else obs), 0.0, True, {"terminal": True}
+
+        # Map to placement for the current piece
+        placement = self._map_action_to_current_piece(action_id)
+
+        # Execute low-level sequence: rotate -> move -> hard drop
+        pre_obs = self.env.get_observation()
+        total_reward = 0.0
+        locked = False
+
+        self._do_rotations(placement.rot)
+        self._move_horizontally(placement.x)
+        _, r, done, info_last = self.env.step(5)  # hard_drop
+        total_reward += float(r)
+        locked = info_last.get("locked", False)
+
+        post_obs = self.env.get_observation()
+        info = {
+            "locked": locked,
+            "lines_cleared": info_last.get("lines_cleared", 0),
+            "action_executed": {
+                "rot": placement.rot,
+                "x": placement.x,
+            },
+        }
+        return (preprocess_observation(post_obs) if self.preprocess else post_obs), total_reward, done, info
+
+    def valid_action_mask(self) -> List[int]:
+        # 1 for indices < len(plist), else 0
+        n = len(PLACEMENTS_BY_PIECE[self.env.cur_id])
+        return [1 if i < n else 0 for i in range(self.action_space_n)]
+
+    def observe(self):
+        obs = self.env.get_observation()
+        return preprocess_observation(obs) if self.preprocess else obs
+
+    # expose some underlying env data
+    @property
+    def done(self) -> bool:
+        return self.env.game_over
+
+    def apply_gravity(self):
+        return self.env.apply_gravity()
+
+
+# -----------------------------
+# Vectorized Environments
+# -----------------------------
+
+class SyncVecTetris:
+    """Synchronous in-process vectorized environment.
+    Useful fallback without multiprocessing overhead.
+    """
+
+    def __init__(self, num_envs: int, seeds: Optional[List[Optional[int]]] = None, preprocess: bool = True):
+        self.num_envs = num_envs
+        if seeds is None:
+            seeds = [None] * num_envs
+        self.envs = [TetrisEnvWrapper(seed=s, preprocess=preprocess) for s in seeds]
+        self.action_space_n = self.envs[0].action_space_n
+
+    def reset(self, seeds: Optional[List[Optional[int]]] = None):
+        obs_batch = []
+        for i, env in enumerate(self.envs):
+            seed = seeds[i] if seeds is not None else None
+            obs_batch.append(env.reset(seed=seed))
+        return obs_batch
+
+    def step(self, actions: List[int]):
+        results = [env.step(int(a)) for env, a in zip(self.envs, actions)]
+        obs, rewards, dones, infos = zip(*results)
+        return list(obs), list(rewards), list(dones), list(infos)
+
+    def valid_action_masks(self) -> List[List[int]]:
+        return [env.valid_action_mask() for env in self.envs]
+
+    def close(self):
+        pass
+
+
+class SubprocVecTetris:
+    """Multiprocess vectorized env using multiprocessing.Pipe.
+
+    Note: On some platforms, 'spawn' start method is used, so ensure this
+    code runs under a __main__ guard when creating instances.
+    """
+
+    def __init__(self, num_envs: int, seeds: Optional[List[Optional[int]]] = None, preprocess: bool = True):
+        import multiprocessing as mp
+        self.num_envs = num_envs
+        self._ctx = mp.get_context("spawn")
+        if seeds is None:
+            seeds = [None] * num_envs
+        self.remotes, self.work_remotes = zip(*[self._ctx.Pipe() for _ in range(num_envs)])
+        self.processes = []
+        self.action_space_n = MAX_ACTIONS_PER_PIECE
+        for wr, seed in zip(self.work_remotes, seeds):
+            p = self._ctx.Process(target=_worker, args=(wr, seed, preprocess))
+            p.daemon = True
+            p.start()
+            self.processes.append(p)
+        # close worker ends in parent
+        for wr in self.work_remotes:
+            wr.close()
+
+    def reset(self, seeds: Optional[List[Optional[int]]] = None):
+        for i, remote in enumerate(self.remotes):
+            remote.send(("reset", None if seeds is None else seeds[i]))
+        return [remote.recv() for remote in self.remotes]
+
+    def step(self, actions: List[int]):
+        for remote, a in zip(self.remotes, actions):
+            remote.send(("step", int(a)))
+        results = [remote.recv() for remote in self.remotes]
+        obs, rewards, dones, infos = zip(*results)
+        return list(obs), list(rewards), list(dones), list(infos)
+
+    def valid_action_masks(self) -> List[List[int]]:
+        for remote in self.remotes:
+            remote.send(("mask", None))
+        return [remote.recv() for remote in self.remotes]
+
+    def close(self):
+        for remote in self.remotes:
+            try:
+                remote.send(("close", None))
+            except Exception:
+                pass
+        for p in self.processes:
+            p.join(timeout=1.0)
+
+
+def _worker(remote, seed: Optional[int], preprocess: bool):
+    env = TetrisEnvWrapper(seed=seed, preprocess=preprocess)
+    while True:
+        cmd, data = remote.recv()
+        if cmd == "reset":
+            ob = env.reset(seed=data)
+            remote.send(ob)
+        elif cmd == "step":
+            ob, r, d, info = env.step(int(data))
+            remote.send((ob, r, d, info))
+        elif cmd == "mask":
+            remote.send(env.valid_action_mask())
+        elif cmd == "close":
+            remote.close()
+            break
+        else:
+            remote.send((None, None))
+
+
+def make_vec_env(num_envs: int, seeds: Optional[List[Optional[int]]] = None, preprocess: bool = True, backend: str = "sync"):
+    """Factory for vectorized Tetris envs.
+
+    backend: 'sync' (in-process) or 'subproc' (multiprocessing)
+    """
+    if backend == "sync":
+        return SyncVecTetris(num_envs=num_envs, seeds=seeds, preprocess=preprocess)
+    elif backend == "subproc":
+        return SubprocVecTetris(num_envs=num_envs, seeds=seeds, preprocess=preprocess)
+    else:
+        raise ValueError("Unsupported backend: {}".format(backend))
+
+
 if __name__ == "__main__":
     # CLI:
     #   python tetris_ai_env.py            -> run game (no recording)
@@ -602,5 +936,23 @@ if __name__ == "__main__":
     elif mode == "headless":
         total = random_rollout(steps=500)
         print("Random rollout finished. Total reward:", total)
+    elif mode == "vec_headless":
+        # demo: vectorized random rollout with high-level actions
+        vec = make_vec_env(num_envs=4, preprocess=True, backend="sync")
+        obs_batch = vec.reset()
+        total = [0.0] * 4
+        steps = 100
+        import random as _r
+        for _ in range(steps):
+            actions = [_r.randrange(0, vec.action_space_n) for _ in range(vec.num_envs)]
+            obs_batch, rewards, dones, infos = vec.step(actions)
+            total = [t + r for t, r in zip(total, rewards)]
+            # optional gravity tick
+            # not applied here; wrapper uses hard drop
+            # reset on done for demo
+            for i, d in enumerate(dones):
+                if d:
+                    obs_batch[i] = vec.envs[i].reset()
+        print("Vec rollout totals:", total)
     else:
         print("Unknown mode. Use: game | record | headless")
