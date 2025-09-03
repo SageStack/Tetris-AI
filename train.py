@@ -47,7 +47,13 @@ ENT_COEF: float = 0.01         # entropy bonus weight
 # Device & Logging
 # -----------------------------
 
-device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Prefer CUDA (NVIDIA), then MPS (Apple Silicon), else CPU
+if torch.cuda.is_available():
+    device: torch.device = torch.device("cuda")
+elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
 
 # Create a TensorBoard writer (creates ./runs/ by default)
 writer: SummaryWriter = SummaryWriter()
