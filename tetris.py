@@ -723,6 +723,12 @@ class TetrisEnvWrapper:
         obs = self.env.reset(seed=seed)
         return preprocess_observation(obs) if self.preprocess else obs
 
+    # Rendering passthrough using the underlying env's renderer
+    def render(self, surface, tile: int = 30):
+        if pygame is None:
+            raise RuntimeError("pygame not available; pip install pygame")
+        self.env.render(surface, tile=tile)
+
     def _map_action_to_current_piece(self, action_id: int) -> Placement:
         # map a global index [0, MAX_ACTIONS_PER_PIECE) to current piece's placement via modulo
         cur_pid = self.env.cur_id
