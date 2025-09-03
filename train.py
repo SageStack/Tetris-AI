@@ -29,14 +29,16 @@ from actor_critic import build_default_model
 # -----------------------------
 
 # Environment
-NUM_ENVS: int = 16
+# Explorer experiment: increase parallel envs for diverse experience
+NUM_ENVS: int = 32
 TOTAL_TIMESTEPS: int = 10_000_000
 
 # PPO core
-N_STEPS: int = 2048            # rollout length per env before update
-PPO_EPOCHS: int = 10           # optimization epochs per update
+# Explorer experiment: larger rollout and bolder updates
+N_STEPS: int = 8192            # rollout length per env before update (increased)
+PPO_EPOCHS: int = 20           # optimization epochs per update (increased)
 BATCH_SIZE: int = 64           # minibatch size
-LEARNING_RATE: float = 1e-4
+LEARNING_RATE: float = 2e-4    # learning rate (slightly increased)
 GAMMA: float = 0.99
 GAE_LAMBDA: float = 0.95
 CLIP_COEF: float = 0.2
