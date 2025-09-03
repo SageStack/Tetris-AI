@@ -265,6 +265,8 @@ if __name__ == "__main__":
     buffer = RolloutBuffer(N_STEPS, NUM_ENVS, spatial_shape, flat_dim, device)
 
     global_step_counter = 0
+    # Indicates final rendering state after training completes
+    training_is_complete = False
 
     # Per-env episodic trackers for logging
     ep_returns = torch.zeros(NUM_ENVS, dtype=torch.float64)
@@ -483,13 +485,50 @@ if __name__ == "__main__":
 
         # After optimizing, loop continues collecting the next rollout.
 
-    # Cleanup
+    # Mark training as complete
+    training_is_complete = True
+
+    # Close training resources before showing final screen
     vec_env.close()
-    # Cleanup rendering
-    try:
-        if render_enabled:
-            import pygame  # type: ignore
-            pygame.quit()
-    except Exception:
-        pass
     writer.close()
+
+    # Post-training completion screen
+    if render_enabled and observer_env is not None and screen is not None:
+        try:
+            import pygame  # type: ignore
+
+            def draw_completion_screen(surface) -> None:
+                # Render the final board state
+                observer_env.render(surface, tile=tile_size)
+
+                # Semi-transparent overlay
+                overlay = pygame.Surface(surface.get_size(), flags=pygame.SRCALPHA)
+                overlay.fill((0, 0, 0, 150))
+                surface.blit(overlay, (0, 0))
+
+                # Centered text
+                font = pygame.font.Font(None, 50)
+                text_surface = font.render("Training Complete", True, (255, 255, 255))
+                text_rect = text_surface.get_rect(center=(surface.get_width() // 2, surface.get_height() // 2))
+                surface.blit(text_surface, text_rect)
+
+                pygame.display.flip()
+
+            running = True
+            while running:
+                draw_completion_screen(screen)
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        running = False
+                if clock is not None:
+                    clock.tick(30)
+
+            pygame.quit()
+        except Exception as e:
+            # Best-effort; ensure pygame quits if initialized
+            try:
+                import pygame  # type: ignore
+                pygame.quit()
+            except Exception:
+                pass
+            print(f"Post-training completion screen error: {e}")
