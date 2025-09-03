@@ -84,6 +84,19 @@ if __name__ == "__main__":
     # CLI args
     parser = argparse.ArgumentParser(description="Train PPO on Tetris")
     parser.add_argument("--render", action="store_true", help="Enable realtime rendering via observer env")
+    parser.add_argument(
+        "--auto-close-render",
+        dest="auto_close_render",
+        action="store_true",
+        default=True,
+        help="Automatically close the render window at end of training (default)",
+    )
+    parser.add_argument(
+        "--no-auto-close-render",
+        dest="auto_close_render",
+        action="store_false",
+        help="Keep the window open and show a completion screen",
+    )
     parser.add_argument("--tile", type=int, default=30, help="Tile size for rendering (pixels)")
     parser.add_argument("--run-name", type=str, default=None, help="Base name for this run's logs under runs/")
     parser.add_argument("--run-dir", type=str, default=None, help="Explicit directory for this run's logs")
@@ -354,11 +367,24 @@ if __name__ == "__main__":
 
         - spatial: (2, 20, 10) -> (N, 2, 20, 10)
         - flat: (43,) -> (N, 43)
+
+        Optimized to avoid PyTorch warning by stacking with NumPy when available.
         """
-        # Convert via torch.as_tensor to preserve dtype if np arrays, fallback to float32
         spatial_list, flat_list = zip(*obs_batch)
-        spatial = torch.as_tensor(spatial_list, device=device, dtype=torch.float32)
-        flat = torch.as_tensor(flat_list, device=device, dtype=torch.float32)
+        try:
+            import numpy as np  # type: ignore
+            spatial_np = np.asarray(spatial_list, dtype=np.float32)
+            flat_np = np.asarray(flat_list, dtype=np.float32)
+            spatial = torch.from_numpy(spatial_np).to(device)
+            flat = torch.from_numpy(flat_np).to(device)
+        except Exception:
+            # Fallback without NumPy: stack tensors directly
+            spatial = torch.stack(
+                [torch.as_tensor(s, dtype=torch.float32) for s in spatial_list]
+            ).to(device)
+            flat = torch.stack(
+                [torch.as_tensor(f, dtype=torch.float32) for f in flat_list]
+            ).to(device)
         return spatial, flat
 
     # -------------------------
@@ -665,33 +691,42 @@ if __name__ == "__main__":
         try:
             import pygame  # type: ignore
 
-            def draw_completion_screen(surface) -> None:
-                # Render the final board state
-                observer_env.render(surface, tile=tile_size)
+            # If auto-close requested, quit immediately so sweeps can proceed
+            if getattr(args, "auto_close_render", False):
+                try:
+                    # Pump events once to keep OS happy, then quit
+                    pygame.event.pump()
+                except Exception:
+                    pass
+                pygame.quit()
+            else:
+                def draw_completion_screen(surface) -> None:
+                    # Render the final board state
+                    observer_env.render(surface, tile=tile_size)
 
-                # Semi-transparent overlay
-                overlay = pygame.Surface(surface.get_size(), flags=pygame.SRCALPHA)
-                overlay.fill((0, 0, 0, 150))
-                surface.blit(overlay, (0, 0))
+                    # Semi-transparent overlay
+                    overlay = pygame.Surface(surface.get_size(), flags=pygame.SRCALPHA)
+                    overlay.fill((0, 0, 0, 150))
+                    surface.blit(overlay, (0, 0))
 
-                # Centered text
-                font = pygame.font.Font(None, 50)
-                text_surface = font.render("Training Complete", True, (255, 255, 255))
-                text_rect = text_surface.get_rect(center=(surface.get_width() // 2, surface.get_height() // 2))
-                surface.blit(text_surface, text_rect)
+                    # Centered text
+                    font = pygame.font.Font(None, 50)
+                    text_surface = font.render("Training Complete", True, (255, 255, 255))
+                    text_rect = text_surface.get_rect(center=(surface.get_width() // 2, surface.get_height() // 2))
+                    surface.blit(text_surface, text_rect)
 
-                pygame.display.flip()
+                    pygame.display.flip()
 
-            running = True
-            while running:
-                draw_completion_screen(screen)
-                for event in pygame.event.get():
-                    if event.type == pygame.QUIT:
-                        running = False
-                if clock is not None:
-                    clock.tick(30)
+                running = True
+                while running:
+                    draw_completion_screen(screen)
+                    for event in pygame.event.get():
+                        if event.type == pygame.QUIT:
+                            running = False
+                    if clock is not None:
+                        clock.tick(30)
 
-            pygame.quit()
+                pygame.quit()
         except Exception as e:
             # Best-effort; ensure pygame quits if initialized
             try:

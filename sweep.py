@@ -66,9 +66,10 @@ def _parse_render_selector(args) -> callable:
                 return lambda i: (i - 1) % k == 0
         except Exception:
             pass
-    if getattr(args, "render_first", True):
+    if getattr(args, "render_first", False):
         return lambda i: i == 1
-    return lambda i: False
+    # Default: render every trial when rendering is enabled
+    return lambda i: True
 
 
 def _loguniform(lo: float, hi: float) -> float:
@@ -137,6 +138,18 @@ def _run_stage(stage_dir: Path, cfg: dict, total_timesteps: int, backend: str, b
     """Run one training stage and return the stage score (mean_return_last_100)."""
     stage_dir.mkdir(parents=True, exist_ok=True)
 
+    # Fast-path resume: if a previous run finished this stage and wrote metrics,
+    # reuse it instead of rerunning training.
+    metrics_path = stage_dir / "metrics.json"
+    if metrics_path.exists():
+        try:
+            metrics = json.loads(metrics_path.read_text())
+            score = float(metrics.get("mean_return_last_100", 0.0))
+            print(f"[sweep] resume: trial {trial_number:03d} stage {stage_index} already complete; score={score:.3f}")
+            return score
+        except Exception:
+            pass
+
     cmd = [
         sys.executable,
         "-u",
@@ -172,7 +185,7 @@ def _run_stage(stage_dir: Path, cfg: dict, total_timesteps: int, backend: str, b
         str(cfg["gae_lambda"]),
     ]
     if render:
-        cmd += ["--render", "--tile", str(int(render_tile))]
+        cmd += ["--render", "--tile", str(int(render_tile)), "--auto-close-render"]
     if base_seed is not None:
         cmd += ["--seed", str(int(base_seed) + trial_number)]
 
@@ -182,7 +195,6 @@ def _run_stage(stage_dir: Path, cfg: dict, total_timesteps: int, backend: str, b
     print(f"[sweep] trial {trial_number:03d} stage {stage_index} -> {stage_dir}")
     subprocess.run(cmd, env=env, check=True)
 
-    metrics_path = stage_dir / "metrics.json"
     if metrics_path.exists():
         try:
             metrics = json.loads(metrics_path.read_text())
@@ -225,11 +237,12 @@ def main():
     # Rendering control (default: render first trial's first stage)
     ap.add_argument("--no-render", dest="render", action="store_false", help="Disable all rendering during sweep")
     ap.set_defaults(render=True)
-    ap.add_argument("--render-first", action="store_true", default=True, help="Render the first trial only (default)")
-    ap.add_argument("--render-all", action="store_true", default=False, help="Render every trial (slow)")
+    ap.add_argument("--render-first", action="store_true", default=False, help="Render the first trial only")
+    ap.add_argument("--render-all", action="store_true", default=False, help="Render every trial (default behavior)")
     ap.add_argument("--render-trials", type=str, default=None, help="Comma-separated trial indices to render, e.g., '1,5,9'")
     ap.add_argument("--render-every", type=int, default=None, help="Render every K trials (e.g., K=5)")
     ap.add_argument("--render-tile", type=int, default=22, help="Tile size for rendered trials")
+    ap.add_argument("--render-all-stages", action="store_true", default=False, help="Render all stages of selected trials (not just stage 1)")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -240,10 +253,18 @@ def main():
     stages = _parse_stages(args)
     should_render = _parse_render_selector(args)
 
-    # Optuna study
+    # Optuna study (default to a persistent SQLite DB for resume capability)
+    default_storage = None
+    try:
+        default_storage = f"sqlite:///{(study_dir / 'study.db').absolute()}"
+    except Exception:
+        # Fallback to local file name if absolute path unavailable
+        default_storage = f"sqlite:///{study_dir}/study.db"
+    storage_url = args.storage or default_storage
+
     sampler = TPESampler(seed=args.seed)
     pruner = SuccessiveHalvingPruner(min_resource=stages[0], reduction_factor=max(2, int(args.growth)), min_early_stopping_rate=0)
-    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner, study_name=args.study_name, storage=args.storage, load_if_exists=True)
+    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner, study_name=args.study_name, storage=storage_url, load_if_exists=True)
 
     csv_path = study_dir / "results.csv"
     if not csv_path.exists():
@@ -263,7 +284,7 @@ def main():
         for si, requested_steps in enumerate(stages, start=1):
             eff_steps = max(int(requested_steps), int(min_steps))
             stage_dir = trial_root / f"stage_{si}"
-            do_render = should_render(trial_idx) and si == 1  # show GUI for the first stage of selected trials
+            do_render = should_render(trial_idx) and (args.render_all_stages or si == 1)  # default: stage 1 only
             score = _run_stage(
                 stage_dir=stage_dir,
                 cfg=cfg,
@@ -277,11 +298,22 @@ def main():
             )
             last_score = score
 
-            # Log row immediately
-            with csv_path.open("a") as fp:
-                fp.write(
-                    f"{trial_idx},{si},{score:.6f},{cfg['num_envs']},{cfg['n_steps']},{cfg['ppo_epochs']},{cfg['batch_size']},{cfg['learning_rate']:.6g},{cfg['clip_coef']:.4f},{cfg['ent_coef']:.5f},{cfg['vf_coef']:.4f},{cfg['gamma']:.5f},{cfg['gae_lambda']:.4f},{stage_dir}\n"
-                )
+            # Log row if not already present (avoid duplicates on resume)
+            existing = False
+            try:
+                if csv_path.exists():
+                    needle = f"{trial_idx},{si},"
+                    for line in csv_path.read_text().splitlines():
+                        if line.startswith(needle):
+                            existing = True
+                            break
+            except Exception:
+                pass
+            if not existing:
+                with csv_path.open("a") as fp:
+                    fp.write(
+                        f"{trial_idx},{si},{score:.6f},{cfg['num_envs']},{cfg['n_steps']},{cfg['ppo_epochs']},{cfg['batch_size']},{cfg['learning_rate']:.6g},{cfg['clip_coef']:.4f},{cfg['ent_coef']:.5f},{cfg['vf_coef']:.4f},{cfg['gamma']:.5f},{cfg['gae_lambda']:.4f},{stage_dir}\n"
+                    )
 
             # Report to Optuna for pruning
             trial.report(last_score, step=eff_steps)
@@ -302,7 +334,19 @@ def main():
             best_out = {"score": best.value, **best_cfg}
             (study_dir / "best_config.json").write_text(json.dumps(best_out, indent=2))
 
-    study.optimize(objective, n_trials=args.trials, callbacks=[_callback])
+    # Continue up to the requested total number of trials on resume
+    try:
+        from optuna.trial import TrialState  # type: ignore
+        finished = [t for t in study.get_trials(deepcopy=False) if t.state in (TrialState.COMPLETE, TrialState.PRUNED)]
+        already_done = len(finished)
+    except Exception:
+        already_done = 0
+    remaining = max(0, int(args.trials) - already_done)
+    if remaining == 0:
+        print(f"[optuna] nothing to do: already have {already_done} finished trials (target={args.trials})")
+    else:
+        print(f"[optuna] resuming: {already_done} finished; running {remaining} more to reach {args.trials}")
+        study.optimize(objective, n_trials=remaining, callbacks=[_callback])
 
     print("[sweep] best value:", study.best_value)
     print("[sweep] best params:", study.best_params)
