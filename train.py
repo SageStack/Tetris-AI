@@ -17,6 +17,9 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.distributions import Categorical
 
 import argparse
+import time
+import uuid
+import json
 from tetris import make_vec_env, TetrisEnvWrapper, BOARD_W, BOARD_H
 from actor_critic import build_default_model
 
@@ -55,8 +58,7 @@ elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
 else:
     device = torch.device("cpu")
 
-# Create a TensorBoard writer (creates ./runs/ by default)
-writer: SummaryWriter = SummaryWriter()
+# TensorBoard writer is created in __main__ so we can customize logdir per run
 
 
 def _print_setup_summary(action_space_n: int) -> None:
@@ -83,7 +85,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PPO on Tetris")
     parser.add_argument("--render", action="store_true", help="Enable realtime rendering via observer env")
     parser.add_argument("--tile", type=int, default=30, help="Tile size for rendering (pixels)")
+    parser.add_argument("--run-name", type=str, default=None, help="Base name for this run's logs under runs/")
+    parser.add_argument(
+        "--log-root",
+        type=str,
+        default="runs",
+        help="Root directory for TensorBoard logs (default: runs)",
+    )
+    parser.add_argument("--notes", type=str, default=None, help="Optional notes string to attach to the run")
     args = parser.parse_args()
+
+    # Build unique log directory for this run
+    base_name = args.run_name or "tetris-ppo"
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    short_uid = uuid.uuid4().hex[:6]
+    run_dir = os.path.join(args.log_root, f"{base_name}-{timestamp}-{short_uid}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    # Create a TensorBoard writer using the explicit run directory
+    writer: SummaryWriter = SummaryWriter(log_dir=run_dir)
 
     # Vectorized Environment (multiprocessing). Keep under __main__ for 'spawn'.
     vec_env = make_vec_env(num_envs=NUM_ENVS, backend="sync")
@@ -115,32 +135,58 @@ if __name__ == "__main__":
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     _print_setup_summary(vec_env.action_space_n)
+    print(f"Run directory:    {run_dir}")
 
     # Example: write hyperparameters to TensorBoard
+    # Log setup and persist config for reproducibility
     try:
-        writer.add_text(
-            "setup/summary",
-            "\n".join(
-                [
-                    f"device: {device}",
-                    f"num_envs: {NUM_ENVS}",
-                    f"total_timesteps: {TOTAL_TIMESTEPS}",
-                    f"n_steps: {N_STEPS}",
-                    f"ppo_epochs: {PPO_EPOCHS}",
-                    f"batch_size: {BATCH_SIZE}",
-                    f"learning_rate: {LEARNING_RATE}",
-                    f"gamma: {GAMMA}",
-                    f"gae_lambda: {GAE_LAMBDA}",
-                    f"clip_coef: {CLIP_COEF}",
-                    f"vf_coef: {VF_COEF}",
-                    f"ent_coef: {ENT_COEF}",
-                    f"action_space_n: {vec_env.action_space_n}",
-                ]
-            ),
-        )
+        setup_lines = [
+            f"device: {device}",
+            f"num_envs: {NUM_ENVS}",
+            f"total_timesteps: {TOTAL_TIMESTEPS}",
+            f"n_steps: {N_STEPS}",
+            f"ppo_epochs: {PPO_EPOCHS}",
+            f"batch_size: {BATCH_SIZE}",
+            f"learning_rate: {LEARNING_RATE}",
+            f"gamma: {GAMMA}",
+            f"gae_lambda: {GAE_LAMBDA}",
+            f"clip_coef: {CLIP_COEF}",
+            f"vf_coef: {VF_COEF}",
+            f"ent_coef: {ENT_COEF}",
+            f"action_space_n: {vec_env.action_space_n}",
+            f"run_dir: {run_dir}",
+        ]
+        if args.notes:
+            setup_lines.append(f"notes: {args.notes}")
+        writer.add_text("setup/summary", "\n".join(setup_lines))
+        # Save config.json in the run directory
+        config = {
+            "device": str(device),
+            "num_envs": NUM_ENVS,
+            "total_timesteps": TOTAL_TIMESTEPS,
+            "n_steps": N_STEPS,
+            "ppo_epochs": PPO_EPOCHS,
+            "batch_size": BATCH_SIZE,
+            "learning_rate": LEARNING_RATE,
+            "gamma": GAMMA,
+            "gae_lambda": GAE_LAMBDA,
+            "clip_coef": CLIP_COEF,
+            "vf_coef": VF_COEF,
+            "ent_coef": ENT_COEF,
+            "action_space_n": vec_env.action_space_n,
+            "render": bool(args.render),
+            "tile": tile_size,
+            "run_name": base_name,
+            "run_dir": run_dir,
+            "notes": args.notes,
+            "timestamp": timestamp,
+            "uid": short_uid,
+        }
+        with open(os.path.join(run_dir, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(config, f, indent=2)
     except Exception as e:
         # Logging is best-effort; continue if TB not available
-        print(f"Warning: failed to log setup to TensorBoard: {e}")
+        print(f"Warning: failed to log setup or save config: {e}")
 
     # ---------------
     # Rollout Buffer
