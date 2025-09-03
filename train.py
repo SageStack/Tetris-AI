@@ -12,6 +12,7 @@ from typing import List, Sequence, Tuple
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributions import Categorical
 
@@ -324,9 +325,89 @@ if __name__ == "__main__":
             )
 
         # At this point: buffer holds transitions; advantages/returns are computed.
-        # Learning phase (PPO update) would go here.
+        # -----------------------------
+        # PPO Learning Phase
+        # -----------------------------
+        # Part 1: Flatten rollout into a single batch and normalize advantages
+        T, N = buffer.n_steps, buffer.num_envs
+        batch_total = T * N
 
-        # Learning step would consume `buffer`, `advantages`, and `returns` here.
+        b_spatial_obs = buffer.spatial_obs.reshape(batch_total, *spatial_shape)
+        b_flat_obs = buffer.flat_obs.reshape(batch_total, flat_dim)
+        b_actions = buffer.actions.reshape(batch_total)
+        b_log_probs = buffer.log_probs.reshape(batch_total)
+        b_advantages = advantages.reshape(batch_total)
+        b_returns = returns.reshape(batch_total)
+
+        # Normalize advantages for stability
+        adv_mean = b_advantages.mean()
+        adv_std = b_advantages.std()
+        b_advantages = (b_advantages - adv_mean) / (adv_std + 1e-8)
+
+        # Part 2: PPO epochs and minibatch optimization
+        model.train()
+        inds = torch.arange(batch_total, device=device)
+
+        # Track averages for logging
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_entropy = 0.0
+        total_loss = 0.0
+        minibatch_updates = 0
+
+        for epoch in range(PPO_EPOCHS):
+            # Shuffle indices each epoch to break temporal correlation
+            perm = inds[torch.randperm(batch_total, device=device)]
+            for start in range(0, batch_total, BATCH_SIZE):
+                end = min(start + BATCH_SIZE, batch_total)
+                mb_inds = perm[start:end]
+
+                mb_spatial = b_spatial_obs[mb_inds]
+                mb_flat = b_flat_obs[mb_inds]
+                mb_actions = b_actions[mb_inds]
+                mb_old_logp = b_log_probs[mb_inds]
+                mb_adv = b_advantages[mb_inds]
+                mb_ret = b_returns[mb_inds]
+
+                new_logits, new_values = model((mb_spatial, mb_flat))
+                dist = Categorical(logits=new_logits)
+                new_logp = dist.log_prob(mb_actions)
+                entropy = dist.entropy().mean()
+
+                # Critic loss (value function)
+                value_loss = F.mse_loss(new_values.squeeze(-1), mb_ret)
+
+                # Actor loss (PPO clipped surrogate)
+                ratio = torch.exp(new_logp - mb_old_logp)
+                surr1 = mb_adv * ratio
+                surr2 = mb_adv * torch.clamp(ratio, 1.0 - CLIP_COEF, 1.0 + CLIP_COEF)
+                policy_loss = -torch.min(surr1, surr2).mean()
+
+                # Total loss
+                loss = policy_loss + VF_COEF * value_loss - ENT_COEF * entropy
+
+                optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                optimizer.step()
+
+                # Accumulate logs
+                total_policy_loss += policy_loss.detach().item()
+                total_value_loss += value_loss.detach().item()
+                total_entropy += entropy.detach().item()
+                total_loss += loss.detach().item()
+                minibatch_updates += 1
+
+        # Log averaged losses for this update
+        if minibatch_updates > 0:
+            try:
+                writer.add_scalar("loss/policy", total_policy_loss / minibatch_updates, global_step_counter)
+                writer.add_scalar("loss/value", total_value_loss / minibatch_updates, global_step_counter)
+                writer.add_scalar("loss/entropy", total_entropy / minibatch_updates, global_step_counter)
+                writer.add_scalar("loss/total", total_loss / minibatch_updates, global_step_counter)
+            except Exception:
+                pass
+
         # After optimizing, loop continues collecting the next rollout.
 
     # Cleanup
