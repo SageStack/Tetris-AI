@@ -20,6 +20,8 @@ import argparse
 import time
 import uuid
 import json
+import signal
+import atexit
 from tetris import make_vec_env, TetrisEnvWrapper, BOARD_W, BOARD_H, build_candidate_tensors_from_board_plane
 from actor_critic import build_default_model
 
@@ -29,21 +31,22 @@ from actor_critic import build_default_model
 # -----------------------------
 
 # Environment (defaults; can be overridden via CLI)
-NUM_ENVS: int = 16
+# Tuned to best sweep: runs/sweeps/ppo-optuna/trial_033/stage_3
+NUM_ENVS: int = 12
 TOTAL_TIMESTEPS: int = 3_000_000
 
 # PPO core (defaults; can be overridden via CLI)
-N_STEPS: int = 2048            # rollout length per env before update
-PPO_EPOCHS: int = 3            # optimization epochs per update
-BATCH_SIZE: int = 256          # minibatch size
-LEARNING_RATE: float = 2.5e-4  # learning rate
-GAMMA: float = 0.995
-GAE_LAMBDA: float = 0.95
-CLIP_COEF: float = 0.2
+N_STEPS: int = 512                     # rollout length per env before update
+PPO_EPOCHS: int = 2                    # optimization epochs per update
+BATCH_SIZE: int = 64                   # minibatch size
+LEARNING_RATE: float = 4.240374814928753e-04  # learning rate
+GAMMA: float = 0.9916345592142025
+GAE_LAMBDA: float = 0.9417171140099482
+CLIP_COEF: float = 0.23665681638771793
 
 # Loss weighting (defaults; can be overridden via CLI)
-VF_COEF: float = 0.5           # value function loss weight
-ENT_COEF: float = 0.002        # entropy bonus weight
+VF_COEF: float = 0.47849844390843776   # value function loss weight
+ENT_COEF: float = 0.014988315776170852  # entropy bonus weight
 
 
 # -----------------------------
@@ -83,7 +86,8 @@ def _print_setup_summary(action_space_n: int) -> None:
 if __name__ == "__main__":
     # CLI args
     parser = argparse.ArgumentParser(description="Train PPO on Tetris")
-    parser.add_argument("--render", action="store_true", help="Enable realtime rendering via observer env")
+    parser.add_argument("--render", action="store_true",
+                        help="Enable realtime rendering via observer env")
     parser.add_argument(
         "--auto-close-render",
         dest="auto_close_render",
@@ -97,31 +101,48 @@ if __name__ == "__main__":
         action="store_false",
         help="Keep the window open and show a completion screen",
     )
-    parser.add_argument("--tile", type=int, default=30, help="Tile size for rendering (pixels)")
-    parser.add_argument("--run-name", type=str, default=None, help="Base name for this run's logs under runs/")
-    parser.add_argument("--run-dir", type=str, default=None, help="Explicit directory for this run's logs")
+    parser.add_argument("--tile", type=int, default=22,
+                        help="Tile size for rendering (pixels)")
+    parser.add_argument("--run-name", type=str, default=None,
+                        help="Base name for this run's logs under runs/")
+    parser.add_argument("--run-dir", type=str, default=None,
+                        help="Explicit directory for this run's logs")
     parser.add_argument(
         "--log-root",
         type=str,
         default="runs",
         help="Root directory for TensorBoard logs (default: runs)",
     )
-    parser.add_argument("--notes", type=str, default=None, help="Optional notes string to attach to the run")
+    parser.add_argument("--notes", type=str, default=None,
+                        help="Optional notes string to attach to the run")
 
     # Hyperparameter overrides
-    parser.add_argument("--num-envs", type=int, default=None, help="Number of parallel environments")
-    parser.add_argument("--total-timesteps", type=int, default=None, help="Total environment steps to train")
-    parser.add_argument("--n-steps", type=int, default=None, help="Rollout length per env before PPO update")
-    parser.add_argument("--ppo-epochs", type=int, default=None, help="PPO optimization epochs per update")
-    parser.add_argument("--batch-size", type=int, default=None, help="Minibatch size for PPO updates")
-    parser.add_argument("--learning-rate", type=float, default=None, help="Optimizer learning rate")
-    parser.add_argument("--gamma", type=float, default=None, help="Discount factor")
-    parser.add_argument("--gae-lambda", type=float, default=None, help="GAE lambda")
-    parser.add_argument("--clip-coef", type=float, default=None, help="PPO clip coefficient")
-    parser.add_argument("--vf-coef", type=float, default=None, help="Value function loss coefficient")
-    parser.add_argument("--ent-coef", type=float, default=None, help="Entropy bonus coefficient")
-    parser.add_argument("--backend", type=str, choices=["sync", "subproc"], default="sync", help="Vec env backend")
-    parser.add_argument("--seed", type=int, default=None, help="Base seed for environment(s)")
+    parser.add_argument("--num-envs", type=int, default=None,
+                        help="Number of parallel environments")
+    parser.add_argument("--total-timesteps", type=int,
+                        default=None, help="Total environment steps to train")
+    parser.add_argument("--n-steps", type=int, default=None,
+                        help="Rollout length per env before PPO update")
+    parser.add_argument("--ppo-epochs", type=int, default=None,
+                        help="PPO optimization epochs per update")
+    parser.add_argument("--batch-size", type=int, default=None,
+                        help="Minibatch size for PPO updates")
+    parser.add_argument("--learning-rate", type=float,
+                        default=None, help="Optimizer learning rate")
+    parser.add_argument("--gamma", type=float,
+                        default=None, help="Discount factor")
+    parser.add_argument("--gae-lambda", type=float,
+                        default=None, help="GAE lambda")
+    parser.add_argument("--clip-coef", type=float,
+                        default=None, help="PPO clip coefficient")
+    parser.add_argument("--vf-coef", type=float, default=None,
+                        help="Value function loss coefficient")
+    parser.add_argument("--ent-coef", type=float,
+                        default=None, help="Entropy bonus coefficient")
+    parser.add_argument("--backend", type=str,
+                        choices=["sync", "subproc"], default="sync", help="Vec env backend")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Base seed for environment(s)")
     args = parser.parse_args()
 
     # Apply hyperparameter overrides (if provided)
@@ -159,7 +180,8 @@ if __name__ == "__main__":
         base_name = args.run_name or "tetris-ppo"
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         short_uid = uuid.uuid4().hex[:6]
-        run_dir = os.path.join(args.log_root, f"{base_name}-{timestamp}-{short_uid}")
+        run_dir = os.path.join(
+            args.log_root, f"{base_name}-{timestamp}-{short_uid}")
         os.makedirs(run_dir, exist_ok=True)
 
     # Create a TensorBoard writer using the explicit run directory
@@ -171,7 +193,8 @@ if __name__ == "__main__":
     if args.seed is not None:
         seeds = [int(args.seed) + i for i in range(NUM_ENVS)]
 
-    vec_env = make_vec_env(num_envs=NUM_ENVS, seeds=seeds, backend=args.backend)
+    vec_env = make_vec_env(
+        num_envs=NUM_ENVS, seeds=seeds, backend=args.backend)
 
     # Optional: observer environment for visualization in main process
     observer_env = None
@@ -197,7 +220,8 @@ if __name__ == "__main__":
                 run_id_title = os.path.basename(run_dir)
             except Exception:
                 run_id_title = "run"
-            pygame.display.set_caption(f"Tetris PPO - Observer - {run_id_title}")
+            pygame.display.set_caption(
+                f"Tetris PPO - Observer - {run_id_title}")
             clock = pygame.time.Clock()
             # Pre-create a small font for lightweight HUD text
             try:
@@ -289,16 +313,22 @@ if __name__ == "__main__":
             self.flat_obs = torch.zeros(
                 (n_steps, num_envs, flat_obs_dim), device=device, dtype=torch.float32
             )
-            self.actions = torch.zeros((n_steps, num_envs), device=device, dtype=torch.long)
-            self.log_probs = torch.zeros((n_steps, num_envs), device=device, dtype=torch.float32)
-            self.rewards = torch.zeros((n_steps, num_envs), device=device, dtype=torch.float32)
-            self.dones = torch.zeros((n_steps, num_envs), device=device, dtype=torch.float32)
-            self.values = torch.zeros((n_steps, num_envs), device=device, dtype=torch.float32)
+            self.actions = torch.zeros(
+                (n_steps, num_envs), device=device, dtype=torch.long)
+            self.log_probs = torch.zeros(
+                (n_steps, num_envs), device=device, dtype=torch.float32)
+            self.rewards = torch.zeros(
+                (n_steps, num_envs), device=device, dtype=torch.float32)
+            self.dones = torch.zeros(
+                (n_steps, num_envs), device=device, dtype=torch.float32)
+            self.values = torch.zeros(
+                (n_steps, num_envs), device=device, dtype=torch.float32)
             # Will allocate valid action masks lazily on first add()
             self.valid_masks = None  # type: ignore[var-annotated]
             self._action_dim = None
             # Current piece id per state for candidate recomputation
-            self.piece_ids = torch.zeros((n_steps, num_envs), device=device, dtype=torch.long)
+            self.piece_ids = torch.zeros(
+                (n_steps, num_envs), device=device, dtype=torch.long)
 
             self.step = 0
 
@@ -316,12 +346,14 @@ if __name__ == "__main__":
         ) -> None:
             t = self.step
             if t >= self.n_steps:
-                raise RuntimeError("RolloutBuffer is full. Call compute/clear before adding more.")
+                raise RuntimeError(
+                    "RolloutBuffer is full. Call compute/clear before adding more.")
             if self.valid_masks is None:
                 # Allocate masks buffer now that we know action dim A
                 self._action_dim = int(valid_mask.shape[1])
                 self.valid_masks = torch.zeros(
-                    (self.n_steps, self.num_envs, self._action_dim), device=self.device, dtype=torch.bool
+                    (self.n_steps, self.num_envs,
+                     self._action_dim), device=self.device, dtype=torch.bool
                 )
             self.spatial_obs[t].copy_(spatial_obs)
             self.flat_obs[t].copy_(flat_obs)
@@ -347,16 +379,20 @@ if __name__ == "__main__":
             Returns (advantages, returns) of shape (T, N) on the same device.
             """
             T, N = self.n_steps, self.num_envs
-            advantages = torch.zeros((T, N), device=self.device, dtype=torch.float32)
-            returns = torch.zeros((T, N), device=self.device, dtype=torch.float32)
+            advantages = torch.zeros(
+                (T, N), device=self.device, dtype=torch.float32)
+            returns = torch.zeros(
+                (T, N), device=self.device, dtype=torch.float32)
 
-            next_adv = torch.zeros((N,), device=self.device, dtype=torch.float32)
+            next_adv = torch.zeros(
+                (N,), device=self.device, dtype=torch.float32)
             next_value = last_values
             next_not_done = 1.0 - last_dones.float()
 
             for t in reversed(range(T)):
                 not_done = 1.0 - self.dones[t]
-                delta = self.rewards[t] + gamma * next_value * next_not_done - self.values[t]
+                delta = self.rewards[t] + gamma * \
+                    next_value * next_not_done - self.values[t]
                 next_adv = delta + gamma * gae_lambda * next_adv * next_not_done
                 advantages[t] = next_adv
                 next_value = self.values[t]
@@ -417,6 +453,55 @@ if __name__ == "__main__":
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
+    # --------------
+    # Checkpointing
+    # --------------
+    best_metric: float = float("-inf")
+    best_ckpt_path = os.path.join(run_dir, "best_model.pt")
+    last_ckpt_path = os.path.join(run_dir, "last_model.pt")
+
+    def save_checkpoint(path: str, tag: str, extra: dict | None = None) -> None:
+        """Save a checkpoint with model, optimizer, and metadata."""
+        try:
+            payload = {
+                "model_state": model.state_dict(),
+                "optimizer_state": optimizer.state_dict(),
+                "action_space_n": int(vec_env.action_space_n),
+                "in_channels": int(inferred_in_channels),
+                "flat_dim": int(inferred_flat_dim),
+                "global_step": int(global_step_counter),
+                "timestamp": time.time(),
+                "tag": str(tag),
+            }
+            if extra:
+                payload.update(extra)
+            os.makedirs(run_dir, exist_ok=True)
+            torch.save(payload, path)
+            print(f"[checkpoint] Saved {tag} -> {path}")
+        except Exception as e:
+            print(f"[checkpoint] Failed to save {tag} at {path}: {e}")
+
+    # Try to always persist a last snapshot on interpreter exit
+    @atexit.register
+    def _save_on_exit():
+        try:
+            save_checkpoint(last_ckpt_path, tag="last_exit")
+        except Exception:
+            pass
+
+    # Convert SIGINT/SIGTERM into KeyboardInterrupt to trigger graceful save
+    def _signal_to_keyboard_interrupt(signum, frame):
+        raise KeyboardInterrupt()
+
+    try:
+        signal.signal(signal.SIGINT, _signal_to_keyboard_interrupt)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGTERM, _signal_to_keyboard_interrupt)
+    except Exception:
+        pass
+
     # Observer initial reset
     if render_enabled and observer_env is not None:
         observer_obs = observer_env.reset()
@@ -427,6 +512,7 @@ if __name__ == "__main__":
     buffer = RolloutBuffer(N_STEPS, NUM_ENVS, spatial_shape, flat_dim, device)
 
     global_step_counter = 0
+    update_idx = 0
     # Indicates final rendering state after training completes
     training_is_complete = False
 
@@ -438,7 +524,8 @@ if __name__ == "__main__":
     recent_returns_window: list[float] = []
     recent_window_size = 100
 
-    while global_step_counter < TOTAL_TIMESTEPS:
+    try:
+        while global_step_counter < TOTAL_TIMESTEPS:
         # Rollout N_STEPS
         model.eval()
         buffer.clear()
@@ -448,17 +535,24 @@ if __name__ == "__main__":
                 if render_enabled and observer_env is not None:
                     # Convert observer obs to tensors and append as batch=1
                     obs_spatial, obs_flat = observer_obs
-                    obs_spatial_t = torch.as_tensor(obs_spatial, device=device, dtype=torch.float32).unsqueeze(0)
-                    obs_flat_t = torch.as_tensor(obs_flat, device=device, dtype=torch.float32).unsqueeze(0)
-                    spatial_in = torch.cat([spatial_tensor, obs_spatial_t], dim=0)
+                    obs_spatial_t = torch.as_tensor(
+                        obs_spatial, device=device, dtype=torch.float32).unsqueeze(0)
+                    obs_flat_t = torch.as_tensor(
+                        obs_flat, device=device, dtype=torch.float32).unsqueeze(0)
+                    spatial_in = torch.cat(
+                        [spatial_tensor, obs_spatial_t], dim=0)
                     flat_in = torch.cat([flat_tensor, obs_flat_t], dim=0)
                     # Piece IDs for vector + observer
-                    piece_ids_vec = torch.as_tensor(getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
-                    piece_id_obs = torch.as_tensor([observer_env.current_piece_id()], device=device, dtype=torch.long)
-                    piece_ids_in = torch.cat([piece_ids_vec, piece_id_obs], dim=0)
+                    piece_ids_vec = torch.as_tensor(
+                        getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
+                    piece_id_obs = torch.as_tensor(
+                        [observer_env.current_piece_id()], device=device, dtype=torch.long)
+                    piece_ids_in = torch.cat(
+                        [piece_ids_vec, piece_id_obs], dim=0)
                 else:
                     spatial_in, flat_in = spatial_tensor, flat_tensor
-                    piece_ids_in = torch.as_tensor(getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
+                    piece_ids_in = torch.as_tensor(
+                        getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
 
                 # Forward pass on combined batch
                 # Build candidate tensors per sample from board plane (channel 0) and piece id
@@ -472,9 +566,11 @@ if __name__ == "__main__":
                 cand_rasters_list = []
                 cand_feats_list = []
                 for i in range(N_combined):
-                    board_plane = spatial_in[i, 0].detach().cpu().numpy() if _np is not None else spatial_in[i, 0].detach().cpu().tolist()
+                    board_plane = spatial_in[i, 0].detach().cpu().numpy(
+                    ) if _np is not None else spatial_in[i, 0].detach().cpu().tolist()
                     pid = int(piece_ids_in[i].item())
-                    rasters_i, feats_i, _ = build_candidate_tensors_from_board_plane(board_plane, pid, pad_to=action_dim)
+                    rasters_i, feats_i, _ = build_candidate_tensors_from_board_plane(
+                        board_plane, pid, pad_to=action_dim)
                     if _np is None:
                         # Convert lists to tensors
                         cr = torch.as_tensor(rasters_i, dtype=torch.float32)
@@ -484,19 +580,24 @@ if __name__ == "__main__":
                         cf = torch.from_numpy(feats_i)
                     cand_rasters_list.append(cr)
                     cand_feats_list.append(cf)
-                cand_rasters = torch.stack(cand_rasters_list, dim=0).to(device)  # (N, A, 1, H, W)
-                cand_feats = torch.stack(cand_feats_list, dim=0).to(device)      # (N, A, F)
+                cand_rasters = torch.stack(cand_rasters_list, dim=0).to(
+                    device)  # (N, A, 1, H, W)
+                cand_feats = torch.stack(cand_feats_list, dim=0).to(
+                    device)      # (N, A, F)
 
-                logits_all, values_all = model((spatial_in, flat_in), cand_inputs=(cand_rasters, cand_feats))
+                logits_all, values_all = model(
+                    (spatial_in, flat_in), cand_inputs=(cand_rasters, cand_feats))
 
                 # Mask invalid actions (vec + optional observer)
-                mask_vec = vec_env.valid_action_masks()  # List[List[int]] (N, A)
+                # List[List[int]] (N, A)
+                mask_vec = vec_env.valid_action_masks()
                 if render_enabled and observer_env is not None:
                     mask_obs = observer_env.valid_action_mask()
                     mask_combined = mask_vec + [mask_obs]
                 else:
                     mask_combined = mask_vec
-                mask = torch.tensor(mask_combined, device=device, dtype=torch.bool)
+                mask = torch.tensor(
+                    mask_combined, device=device, dtype=torch.bool)
                 logits_all = logits_all.masked_fill(~mask, -torch.inf)
 
                 # Sample actions over combined
@@ -510,13 +611,15 @@ if __name__ == "__main__":
                 values_vec = values_all[:NUM_ENVS]
 
                 # Step training environments
-                next_obs_list, rewards_np, dones_np, infos_list = vec_env.step(actions_vec.detach().cpu().tolist())
+                next_obs_list, rewards_np, dones_np, infos_list = vec_env.step(
+                    actions_vec.detach().cpu().tolist())
 
                 # Step observer environment and render (do not store/learn from it)
                 if render_enabled and observer_env is not None:
                     import pygame  # type: ignore
                     action_obs = int(actions_all[-1].item())
-                    observer_obs, observer_reward, observer_done, observer_info = observer_env.step(action_obs)
+                    observer_obs, observer_reward, observer_done, observer_info = observer_env.step(
+                        action_obs)
                     # Draw
                     if screen is not None:
                         observer_env.render(screen, tile=tile_size)
@@ -526,7 +629,8 @@ if __name__ == "__main__":
                         except Exception:
                             run_id = "run"
                         if 'hud_font' in locals() and hud_font is not None:
-                            text_surface = hud_font.render(f"Run: {run_id}", True, (230, 230, 230))
+                            text_surface = hud_font.render(
+                                f"Run: {run_id}", True, (230, 230, 230))
                             screen.blit(text_surface, (10, 6))
                         # process events so the window stays responsive
                         for event in pygame.event.get():
@@ -540,8 +644,10 @@ if __name__ == "__main__":
                         observer_obs = observer_env.reset()
 
                 # Convert rewards/dones
-                rewards = torch.tensor(rewards_np, device=device, dtype=torch.float32)
-                dones = torch.tensor(dones_np, device=device, dtype=torch.float32)
+                rewards = torch.tensor(
+                    rewards_np, device=device, dtype=torch.float32)
+                dones = torch.tensor(
+                    dones_np, device=device, dtype=torch.float32)
 
                 # Store step in buffer (with masks limited to vectorized envs)
                 buffer.add(
@@ -565,8 +671,10 @@ if __name__ == "__main__":
                     if done:
                         # Log episodic stats
                         try:
-                            writer.add_scalar("charts/episodic_return", ep_returns[i].item(), global_step_counter)
-                            writer.add_scalar("charts/episodic_length", ep_lengths[i].item(), global_step_counter)
+                            writer.add_scalar(
+                                "charts/episodic_return", ep_returns[i].item(), global_step_counter)
+                            writer.add_scalar(
+                                "charts/episodic_length", ep_lengths[i].item(), global_step_counter)
                         except Exception:
                             pass
                         # Track for metrics
@@ -606,7 +714,8 @@ if __name__ == "__main__":
                         new_obs_list = vec_env.reset()
 
                 # Update current state tensors
-                spatial_tensor, flat_tensor = batch_obs_to_tensors(new_obs_list, device)
+                spatial_tensor, flat_tensor = batch_obs_to_tensors(
+                    new_obs_list, device)
 
                 # Increase global step count
                 global_step_counter += NUM_ENVS
@@ -615,7 +724,8 @@ if __name__ == "__main__":
 
             # Bootstrap value for last obs
             # Candidate tensors for last states
-            piece_ids_last = torch.as_tensor(getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
+            piece_ids_last = torch.as_tensor(
+                getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
             cand_rasters_list = []
             cand_feats_list = []
             try:
@@ -623,17 +733,24 @@ if __name__ == "__main__":
             except Exception:
                 _np = None
             for i in range(spatial_tensor.size(0)):
-                board_plane = spatial_tensor[i, 0].detach().cpu().numpy() if _np is not None else spatial_tensor[i, 0].detach().cpu().tolist()
+                board_plane = spatial_tensor[i, 0].detach().cpu().numpy(
+                ) if _np is not None else spatial_tensor[i, 0].detach().cpu().tolist()
                 pid = int(piece_ids_last[i].item())
-                r_i, f_i, _ = build_candidate_tensors_from_board_plane(board_plane, pid, pad_to=vec_env.action_space_n)
-                cr = torch.from_numpy(r_i) if _np is not None else torch.as_tensor(r_i, dtype=torch.float32)
-                cf = torch.from_numpy(f_i) if _np is not None else torch.as_tensor(f_i, dtype=torch.float32)
+                r_i, f_i, _ = build_candidate_tensors_from_board_plane(
+                    board_plane, pid, pad_to=vec_env.action_space_n)
+                cr = torch.from_numpy(r_i) if _np is not None else torch.as_tensor(
+                    r_i, dtype=torch.float32)
+                cf = torch.from_numpy(f_i) if _np is not None else torch.as_tensor(
+                    f_i, dtype=torch.float32)
                 cand_rasters_list.append(cr)
                 cand_feats_list.append(cf)
-            cand_rasters_last = torch.stack(cand_rasters_list, dim=0).to(device)
+            cand_rasters_last = torch.stack(
+                cand_rasters_list, dim=0).to(device)
             cand_feats_last = torch.stack(cand_feats_list, dim=0).to(device)
-            last_logits, last_values = model((spatial_tensor, flat_tensor), cand_inputs=(cand_rasters_last, cand_feats_last))
-            last_dones = torch.tensor([0.0] * NUM_ENVS, device=device)  # By construction, states here are non-terminal
+            last_logits, last_values = model(
+                (spatial_tensor, flat_tensor), cand_inputs=(cand_rasters_last, cand_feats_last))
+            # By construction, states here are non-terminal
+            last_dones = torch.tensor([0.0] * NUM_ENVS, device=device)
             advantages, returns = buffer.compute_returns_and_advantages(
                 last_values=last_values, last_dones=last_dones, gamma=GAMMA, gae_lambda=GAE_LAMBDA
             )
@@ -654,7 +771,8 @@ if __name__ == "__main__":
         b_returns = returns.reshape(batch_total)
         # Flattened masks for PPO loss (A inferred from buffer)
         if buffer.valid_masks is None:
-            raise RuntimeError("valid_masks missing in buffer; expected after collection.")
+            raise RuntimeError(
+                "valid_masks missing in buffer; expected after collection.")
         action_dim = int(buffer.valid_masks.shape[-1])
         b_valid_masks = buffer.valid_masks.reshape(batch_total, action_dim)
 
@@ -697,17 +815,22 @@ if __name__ == "__main__":
                 crs = []
                 cfs = []
                 for i in range(mb_spatial.size(0)):
-                    bp = mb_spatial[i, 0].detach().cpu().numpy() if _np is not None else mb_spatial[i, 0].detach().cpu().tolist()
+                    bp = mb_spatial[i, 0].detach().cpu().numpy(
+                    ) if _np is not None else mb_spatial[i, 0].detach().cpu().tolist()
                     pid = int(mb_piece_ids[i].item())
-                    r_i, f_i, _ = build_candidate_tensors_from_board_plane(bp, pid, pad_to=vec_env.action_space_n)
-                    cr = torch.from_numpy(r_i) if _np is not None else torch.as_tensor(r_i, dtype=torch.float32)
-                    cf = torch.from_numpy(f_i) if _np is not None else torch.as_tensor(f_i, dtype=torch.float32)
+                    r_i, f_i, _ = build_candidate_tensors_from_board_plane(
+                        bp, pid, pad_to=vec_env.action_space_n)
+                    cr = torch.from_numpy(r_i) if _np is not None else torch.as_tensor(
+                        r_i, dtype=torch.float32)
+                    cf = torch.from_numpy(f_i) if _np is not None else torch.as_tensor(
+                        f_i, dtype=torch.float32)
                     crs.append(cr)
                     cfs.append(cf)
                 mb_cand_rasters = torch.stack(crs, dim=0).to(device)
                 mb_cand_feats = torch.stack(cfs, dim=0).to(device)
 
-                new_logits, new_values = model((mb_spatial, mb_flat), cand_inputs=(mb_cand_rasters, mb_cand_feats))
+                new_logits, new_values = model(
+                    (mb_spatial, mb_flat), cand_inputs=(mb_cand_rasters, mb_cand_feats))
                 # Apply categorical mask before distribution
                 new_logits = new_logits.masked_fill(~mb_masks, -torch.inf)
                 dist = Categorical(logits=new_logits)
@@ -720,7 +843,8 @@ if __name__ == "__main__":
                 # Actor loss (PPO clipped surrogate)
                 ratio = torch.exp(new_logp - mb_old_logp)
                 surr1 = mb_adv * ratio
-                surr2 = mb_adv * torch.clamp(ratio, 1.0 - CLIP_COEF, 1.0 + CLIP_COEF)
+                surr2 = mb_adv * \
+                    torch.clamp(ratio, 1.0 - CLIP_COEF, 1.0 + CLIP_COEF)
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 # Total loss
@@ -738,27 +862,53 @@ if __name__ == "__main__":
                 total_loss += loss.detach().item()
                 minibatch_updates += 1
 
-        # Log averaged losses for this update
-        if minibatch_updates > 0:
-            try:
-                writer.add_scalar("loss/policy", total_policy_loss / minibatch_updates, global_step_counter)
-                writer.add_scalar("loss/value", total_value_loss / minibatch_updates, global_step_counter)
-                writer.add_scalar("loss/entropy", total_entropy / minibatch_updates, global_step_counter)
-                writer.add_scalar("loss/total", total_loss / minibatch_updates, global_step_counter)
-                # Also log rolling episodic return mean if available
-                if recent_returns_window:
+            # Log averaged losses for this update
+            if minibatch_updates > 0:
+                update_idx += 1
+                try:
                     writer.add_scalar(
-                        "charts/episodic_return_mean_last_100",
-                        sum(recent_returns_window) / max(1, len(recent_returns_window)),
-                        global_step_counter,
-                    )
-            except Exception:
-                pass
+                        "loss/policy", total_policy_loss / minibatch_updates, global_step_counter)
+                    writer.add_scalar("loss/value", total_value_loss /
+                                      minibatch_updates, global_step_counter)
+                    writer.add_scalar("loss/entropy", total_entropy /
+                                      minibatch_updates, global_step_counter)
+                    writer.add_scalar("loss/total", total_loss /
+                                      minibatch_updates, global_step_counter)
+                    # Also log rolling episodic return mean if available
+                    if recent_returns_window:
+                        current_mean_last_100 = (
+                            sum(recent_returns_window) / max(1, len(recent_returns_window))
+                        )
+                        writer.add_scalar(
+                            "charts/episodic_return_mean_last_100",
+                            current_mean_last_100,
+                            global_step_counter,
+                        )
+                        if current_mean_last_100 > best_metric:
+                            best_metric = float(current_mean_last_100)
+                            save_checkpoint(
+                                best_ckpt_path,
+                                tag="best",
+                                extra={"best_metric": best_metric, "update": update_idx},
+                            )
+                except Exception:
+                    pass
 
-        # After optimizing, loop continues collecting the next rollout.
+                # Keep a rolling "last" checkpoint after each update
+                save_checkpoint(
+                    last_ckpt_path, tag="last", extra={"update": update_idx}
+                )
 
-    # Mark training as complete
-    training_is_complete = True
+            # After optimizing, loop continues collecting the next rollout.
+
+        # Mark training as complete (normal termination)
+        training_is_complete = True
+    except KeyboardInterrupt:
+        print("\n[interrupt] Caught KeyboardInterrupt. Saving last checkpoint and closing...")
+        try:
+            save_checkpoint(last_ckpt_path, tag="last_interrupt")
+        except Exception:
+            pass
 
     # Close training resources before showing final screen
     vec_env.close()
@@ -812,14 +962,17 @@ if __name__ == "__main__":
                     observer_env.render(surface, tile=tile_size)
 
                     # Semi-transparent overlay
-                    overlay = pygame.Surface(surface.get_size(), flags=pygame.SRCALPHA)
+                    overlay = pygame.Surface(
+                        surface.get_size(), flags=pygame.SRCALPHA)
                     overlay.fill((0, 0, 0, 150))
                     surface.blit(overlay, (0, 0))
 
                     # Centered text
                     font = pygame.font.Font(None, 50)
-                    text_surface = font.render("Training Complete", True, (255, 255, 255))
-                    text_rect = text_surface.get_rect(center=(surface.get_width() // 2, surface.get_height() // 2))
+                    text_surface = font.render(
+                        "Training Complete", True, (255, 255, 255))
+                    text_rect = text_surface.get_rect(
+                        center=(surface.get_width() // 2, surface.get_height() // 2))
                     surface.blit(text_surface, text_rect)
 
                     pygame.display.flip()
