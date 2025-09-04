@@ -1,0 +1,21 @@
+{
+  "episodes": 2389,
+  "mean_return_overall": 155.0092758623413,
+  "max_return": 35253.984375,
+  "mean_return_last_100": 2829.6525963974,
+  "config": {
+    "num_envs": 12,
+    "total_timesteps": 3000000,
+    "n_steps": 512,
+    "ppo_epochs": 2,
+    "batch_size": 64,
+    "learning_rate": 0.0004240374814928753,
+    "gamma": 0.9916345592142025,
+    "gae_lambda": 0.9417171140099482,
+    "clip_coef": 0.23665681638771793,
+    "vf_coef": 0.47849844390843776,
+    "ent_coef": 0.014988315776170852,
+    "backend": "sync",
+    "seed": null
+  }
+}

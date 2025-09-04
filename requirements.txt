@@ -4,3 +4,4 @@ pygame
 tensorboard
 optuna
 python-dotenv
+PyQt5
