@@ -26,14 +26,25 @@ import random
 import subprocess
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
 
 try:
     import optuna
     from optuna.samplers import TPESampler
     from optuna.pruners import SuccessiveHalvingPruner
+    from optuna.storages import RDBStorage
 except Exception as e:
     print("Error: Optuna is required for this sweep runner. Install with 'pip install optuna'.")
     raise
+
+# Persistent storage configuration for scalable, parallel sweeps.
+# Set a PostgreSQL URL here (or via env VAR) to enable multi-machine workers.
+# Example PostgreSQL URL:
+#   postgresql+psycopg2://USER:PASSWORD@HOST:5432/optuna
+# For quick local testing, you can switch to SQLite with:
+#   sqlite:///db.sqlite3
+# Note: SQLite is fine for a single machine; use PostgreSQL for true parallel, multi-host sweeps.
+DB_URL = "postgresql://PGUSER:PGPASSWORD@ep-cold-hall-a7lvj857-pooler.ap-southeast-2.aws.neon.tech/neondb?sslmode=require"
 
 
 def _parse_render_selector(args) -> callable:
@@ -96,7 +107,8 @@ def suggest_hparams(trial: "optuna.Trial", profile: str) -> dict:
         num_envs = trial.suggest_categorical("num_envs", [8, 12, 16, 24, 32])
         n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096])
         ppo_epochs = trial.suggest_categorical("ppo_epochs", [2, 3, 4])
-        batch_size = trial.suggest_categorical("batch_size", [64, 128, 256, 512])
+        batch_size = trial.suggest_categorical(
+            "batch_size", [64, 128, 256, 512])
         lr = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
         clip_coef = trial.suggest_float("clip_coef", 0.1, 0.3)
         ent_coef = trial.suggest_float("ent_coef", 0.0, 0.02)
@@ -145,7 +157,8 @@ def _run_stage(stage_dir: Path, cfg: dict, total_timesteps: int, backend: str, b
         try:
             metrics = json.loads(metrics_path.read_text())
             score = float(metrics.get("mean_return_last_100", 0.0))
-            print(f"[sweep] resume: trial {trial_number:03d} stage {stage_index} already complete; score={score:.3f}")
+            print(
+                f"[sweep] resume: trial {trial_number:03d} stage {stage_index} already complete; score={score:.3f}")
             return score
         except Exception:
             pass
@@ -185,14 +198,16 @@ def _run_stage(stage_dir: Path, cfg: dict, total_timesteps: int, backend: str, b
         str(cfg["gae_lambda"]),
     ]
     if render:
-        cmd += ["--render", "--tile", str(int(render_tile)), "--auto-close-render"]
+        cmd += ["--render", "--tile",
+                str(int(render_tile)), "--auto-close-render"]
     if base_seed is not None:
         cmd += ["--seed", str(int(base_seed) + trial_number)]
 
     env = os.environ.copy()
     env.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
-    print(f"[sweep] trial {trial_number:03d} stage {stage_index} -> {stage_dir}")
+    print(
+        f"[sweep] trial {trial_number:03d} stage {stage_index} -> {stage_dir}")
     subprocess.run(cmd, env=env, check=True)
 
     if metrics_path.exists():
@@ -200,7 +215,8 @@ def _run_stage(stage_dir: Path, cfg: dict, total_timesteps: int, backend: str, b
             metrics = json.loads(metrics_path.read_text())
             return float(metrics.get("mean_return_last_100", 0.0))
         except Exception as e:
-            print(f"[sweep] warning: failed to parse metrics in {metrics_path}: {e}")
+            print(
+                f"[sweep] warning: failed to parse metrics in {metrics_path}: {e}")
             return 0.0
     print(f"[sweep] warning: metrics.json missing for stage {stage_dir}")
     return 0.0
@@ -210,7 +226,8 @@ def _parse_stages(args) -> list[int]:
     # Allow explicit stages or (base, rungs, growth)
     if args.stages:
         try:
-            vals = [int(x.strip()) for x in str(args.stages).split(',') if x.strip()]
+            vals = [int(x.strip())
+                    for x in str(args.stages).split(',') if x.strip()]
             if vals:
                 return vals
         except Exception:
@@ -222,27 +239,45 @@ def _parse_stages(args) -> list[int]:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Optuna TPE + ASHA sweep for Tetris PPO")
-    ap.add_argument("--trials", type=int, default=20, help="Number of Optuna trials")
-    ap.add_argument("--study-name", type=str, default="ppo-optuna", help="Study name under runs/sweeps/")
-    ap.add_argument("--storage", type=str, default=None, help="Optuna storage URL (e.g., sqlite:///study.db)")
-    ap.add_argument("--seed", type=int, default=0, help="Base seed for reproducibility")
-    ap.add_argument("--backend", type=str, choices=["sync", "subproc"], default="sync")
-    ap.add_argument("--profile", type=str, choices=["quick", "balanced", "thorough"], default="balanced")
+    ap = argparse.ArgumentParser(
+        description="Optuna TPE + ASHA sweep for Tetris PPO")
+    ap.add_argument("--trials", type=int, default=20,
+                    help="Number of Optuna trials")
+    ap.add_argument("--study-name", type=str, default="ppo-optuna",
+                    help="Study name under runs/sweeps/")
+    ap.add_argument("--storage", type=str, default=None,
+                    help="Optuna storage URL (e.g., sqlite:///study.db)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="Base seed for reproducibility")
+    ap.add_argument("--backend", type=str,
+                    choices=["sync", "subproc"], default="sync")
+    ap.add_argument("--profile", type=str,
+                    choices=["quick", "balanced", "thorough"], default="balanced")
     # Stages: either explicit or geometric schedule
-    ap.add_argument("--stages", type=str, default=None, help="Comma-separated timesteps per stage, e.g., '15000,60000,180000'")
-    ap.add_argument("--base-steps", dest="base_steps", type=int, default=15000, help="Base timesteps for stage 1 (if --stages not set)")
-    ap.add_argument("--rungs", type=int, default=3, help="Number of stages for ASHA (if --stages not set)")
-    ap.add_argument("--growth", type=float, default=3.0, help="Multiplier for each subsequent stage (if --stages not set)")
+    ap.add_argument("--stages", type=str, default=None,
+                    help="Comma-separated timesteps per stage, e.g., '15000,60000,180000'")
+    ap.add_argument("--base-steps", dest="base_steps", type=int, default=15000,
+                    help="Base timesteps for stage 1 (if --stages not set)")
+    ap.add_argument("--rungs", type=int, default=3,
+                    help="Number of stages for ASHA (if --stages not set)")
+    ap.add_argument("--growth", type=float, default=3.0,
+                    help="Multiplier for each subsequent stage (if --stages not set)")
     # Rendering control (default: render first trial's first stage)
-    ap.add_argument("--no-render", dest="render", action="store_false", help="Disable all rendering during sweep")
+    ap.add_argument("--no-render", dest="render", action="store_false",
+                    help="Disable all rendering during sweep")
     ap.set_defaults(render=True)
-    ap.add_argument("--render-first", action="store_true", default=False, help="Render the first trial only")
-    ap.add_argument("--render-all", action="store_true", default=False, help="Render every trial (default behavior)")
-    ap.add_argument("--render-trials", type=str, default=None, help="Comma-separated trial indices to render, e.g., '1,5,9'")
-    ap.add_argument("--render-every", type=int, default=None, help="Render every K trials (e.g., K=5)")
-    ap.add_argument("--render-tile", type=int, default=22, help="Tile size for rendered trials")
-    ap.add_argument("--render-all-stages", action="store_true", default=False, help="Render all stages of selected trials (not just stage 1)")
+    ap.add_argument("--render-first", action="store_true",
+                    default=False, help="Render the first trial only")
+    ap.add_argument("--render-all", action="store_true",
+                    default=False, help="Render every trial (default behavior)")
+    ap.add_argument("--render-trials", type=str, default=None,
+                    help="Comma-separated trial indices to render, e.g., '1,5,9'")
+    ap.add_argument("--render-every", type=int, default=None,
+                    help="Render every K trials (e.g., K=5)")
+    ap.add_argument("--render-tile", type=int, default=22,
+                    help="Tile size for rendered trials")
+    ap.add_argument("--render-all-stages", action="store_true", default=False,
+                    help="Render all stages of selected trials (not just stage 1)")
     args = ap.parse_args()
 
     random.seed(args.seed)
@@ -253,18 +288,43 @@ def main():
     stages = _parse_stages(args)
     should_render = _parse_render_selector(args)
 
-    # Optuna study (default to a persistent SQLite DB for resume capability)
-    default_storage = None
-    try:
-        default_storage = f"sqlite:///{(study_dir / 'study.db').absolute()}"
-    except Exception:
-        # Fallback to local file name if absolute path unavailable
-        default_storage = f"sqlite:///{study_dir}/study.db"
-    storage_url = args.storage or default_storage
+    # Optuna storage: prefer explicit DB via CLI or env, else local SQLite file for easy testing
+    # Priority: --storage > OPTUNA_DB_URL > local sqlite under runs/sweeps/<study>/study.db
+    resolved_db_url = (args.storage or DB_URL).strip()
+    if not resolved_db_url:
+        try:
+            resolved_db_url = f"sqlite:///{(study_dir / 'study.db').absolute()}"
+        except Exception:
+            resolved_db_url = f"sqlite:///{study_dir}/study.db"
+    storage = RDBStorage(url=resolved_db_url)
 
-    sampler = TPESampler(seed=args.seed)
-    pruner = SuccessiveHalvingPruner(min_resource=stages[0], reduction_factor=max(2, int(args.growth)), min_early_stopping_rate=0)
-    study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner, study_name=args.study_name, storage=storage_url, load_if_exists=True)
+    # Use Bayesian optimization via TPE. Enable options that play well with parallel workers.
+    # Prefer a parallel-friendly TPE; fall back gracefully for older Optuna versions
+    try:
+        sampler = TPESampler(
+            seed=args.seed,
+            multivariate=True,
+            group=True,
+            constant_liar=True,
+        )
+    except TypeError:
+        try:
+            sampler = TPESampler(seed=args.seed, constant_liar=True)
+        except TypeError:
+            sampler = TPESampler(seed=args.seed)
+    pruner = SuccessiveHalvingPruner(
+        min_resource=stages[0],
+        reduction_factor=max(2, int(args.growth)),
+        min_early_stopping_rate=0,
+    )
+    study = optuna.create_study(
+        direction="maximize",
+        sampler=sampler,
+        pruner=pruner,
+        study_name=args.study_name,
+        storage=storage,
+        load_if_exists=True,
+    )
 
     csv_path = study_dir / "results.csv"
     if not csv_path.exists():
@@ -284,7 +344,8 @@ def main():
         for si, requested_steps in enumerate(stages, start=1):
             eff_steps = max(int(requested_steps), int(min_steps))
             stage_dir = trial_root / f"stage_{si}"
-            do_render = should_render(trial_idx) and (args.render_all_stages or si == 1)  # default: stage 1 only
+            do_render = should_render(trial_idx) and (
+                args.render_all_stages or si == 1)  # default: stage 1 only
             score = _run_stage(
                 stage_dir=stage_dir,
                 cfg=cfg,
@@ -325,7 +386,8 @@ def main():
     # Optional: print progress and best so far after each trial
     def _callback(study: "optuna.Study", trial: "optuna.FrozenTrial"):
         if trial.state == optuna.trial.TrialState.COMPLETE:
-            print(f"[optuna] completed trial {trial.number} value={trial.value:.3f}")
+            print(
+                f"[optuna] completed trial {trial.number} value={trial.value:.3f}")
         elif trial.state == optuna.trial.TrialState.PRUNED:
             print(f"[optuna] pruned trial {trial.number}")
         best = study.best_trial if study.best_trial else None
@@ -337,15 +399,18 @@ def main():
     # Continue up to the requested total number of trials on resume
     try:
         from optuna.trial import TrialState  # type: ignore
-        finished = [t for t in study.get_trials(deepcopy=False) if t.state in (TrialState.COMPLETE, TrialState.PRUNED)]
+        finished = [t for t in study.get_trials(deepcopy=False) if t.state in (
+            TrialState.COMPLETE, TrialState.PRUNED)]
         already_done = len(finished)
     except Exception:
         already_done = 0
     remaining = max(0, int(args.trials) - already_done)
     if remaining == 0:
-        print(f"[optuna] nothing to do: already have {already_done} finished trials (target={args.trials})")
+        print(
+            f"[optuna] nothing to do: already have {already_done} finished trials (target={args.trials})")
     else:
-        print(f"[optuna] resuming: {already_done} finished; running {remaining} more to reach {args.trials}")
+        print(
+            f"[optuna] resuming: {already_done} finished; running {remaining} more to reach {args.trials}")
         study.optimize(objective, n_trials=remaining, callbacks=[_callback])
 
     print("[sweep] best value:", study.best_value)
