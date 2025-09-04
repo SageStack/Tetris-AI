@@ -20,7 +20,7 @@ import argparse
 import time
 import uuid
 import json
-from tetris import make_vec_env, TetrisEnvWrapper, BOARD_W, BOARD_H
+from tetris import make_vec_env, TetrisEnvWrapper, BOARD_W, BOARD_H, build_candidate_tensors_from_board_plane
 from actor_critic import build_default_model
 
 
@@ -205,10 +205,7 @@ if __name__ == "__main__":
             except Exception:
                 hud_font = pygame.font.Font(None, 18)
 
-    # Model & optimizer
-    model = build_default_model(vec_env.action_space_n).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-
+    # Defer model creation until after first reset to infer input dims
     _print_setup_summary(vec_env.action_space_n)
     print(f"Run directory:    {run_dir}")
 
@@ -297,6 +294,11 @@ if __name__ == "__main__":
             self.rewards = torch.zeros((n_steps, num_envs), device=device, dtype=torch.float32)
             self.dones = torch.zeros((n_steps, num_envs), device=device, dtype=torch.float32)
             self.values = torch.zeros((n_steps, num_envs), device=device, dtype=torch.float32)
+            # Will allocate valid action masks lazily on first add()
+            self.valid_masks = None  # type: ignore[var-annotated]
+            self._action_dim = None
+            # Current piece id per state for candidate recomputation
+            self.piece_ids = torch.zeros((n_steps, num_envs), device=device, dtype=torch.long)
 
             self.step = 0
 
@@ -309,10 +311,18 @@ if __name__ == "__main__":
             rewards: Tensor,              # (N,)
             dones: Tensor,                # (N,)
             values: Tensor,               # (N,)
+            valid_mask: Tensor,           # (N, A) bool
+            piece_ids: Tensor,            # (N,) long
         ) -> None:
             t = self.step
             if t >= self.n_steps:
                 raise RuntimeError("RolloutBuffer is full. Call compute/clear before adding more.")
+            if self.valid_masks is None:
+                # Allocate masks buffer now that we know action dim A
+                self._action_dim = int(valid_mask.shape[1])
+                self.valid_masks = torch.zeros(
+                    (self.n_steps, self.num_envs, self._action_dim), device=self.device, dtype=torch.bool
+                )
             self.spatial_obs[t].copy_(spatial_obs)
             self.flat_obs[t].copy_(flat_obs)
             self.actions[t].copy_(actions)
@@ -320,6 +330,8 @@ if __name__ == "__main__":
             self.rewards[t].copy_(rewards)
             self.dones[t].copy_(dones)
             self.values[t].copy_(values)
+            self.valid_masks[t].copy_(valid_mask)  # type: ignore[index]
+            self.piece_ids[t].copy_(piece_ids)
             self.step += 1
 
         @torch.no_grad()
@@ -395,6 +407,16 @@ if __name__ == "__main__":
     obs_list = vec_env.reset()
     spatial_tensor, flat_tensor = batch_obs_to_tensors(obs_list, device)
 
+    # Model & optimizer (use inferred input shapes)
+    inferred_in_channels = int(spatial_tensor.shape[1])
+    inferred_flat_dim = int(flat_tensor.shape[1])
+    model = build_default_model(
+        vec_env.action_space_n,
+        in_channels=inferred_in_channels,
+        flat_dim=inferred_flat_dim,
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
     # Observer initial reset
     if render_enabled and observer_env is not None:
         observer_obs = observer_env.reset()
@@ -430,11 +452,42 @@ if __name__ == "__main__":
                     obs_flat_t = torch.as_tensor(obs_flat, device=device, dtype=torch.float32).unsqueeze(0)
                     spatial_in = torch.cat([spatial_tensor, obs_spatial_t], dim=0)
                     flat_in = torch.cat([flat_tensor, obs_flat_t], dim=0)
+                    # Piece IDs for vector + observer
+                    piece_ids_vec = torch.as_tensor(getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
+                    piece_id_obs = torch.as_tensor([observer_env.current_piece_id()], device=device, dtype=torch.long)
+                    piece_ids_in = torch.cat([piece_ids_vec, piece_id_obs], dim=0)
                 else:
                     spatial_in, flat_in = spatial_tensor, flat_tensor
+                    piece_ids_in = torch.as_tensor(getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
 
                 # Forward pass on combined batch
-                logits_all, values_all = model((spatial_in, flat_in))
+                # Build candidate tensors per sample from board plane (channel 0) and piece id
+                N_combined = spatial_in.size(0)
+                action_dim = vec_env.action_space_n
+                H, W = spatial_in.size(-2), spatial_in.size(-1)
+                try:
+                    import numpy as _np
+                except Exception:
+                    _np = None
+                cand_rasters_list = []
+                cand_feats_list = []
+                for i in range(N_combined):
+                    board_plane = spatial_in[i, 0].detach().cpu().numpy() if _np is not None else spatial_in[i, 0].detach().cpu().tolist()
+                    pid = int(piece_ids_in[i].item())
+                    rasters_i, feats_i, _ = build_candidate_tensors_from_board_plane(board_plane, pid, pad_to=action_dim)
+                    if _np is None:
+                        # Convert lists to tensors
+                        cr = torch.as_tensor(rasters_i, dtype=torch.float32)
+                        cf = torch.as_tensor(feats_i, dtype=torch.float32)
+                    else:
+                        cr = torch.from_numpy(rasters_i)
+                        cf = torch.from_numpy(feats_i)
+                    cand_rasters_list.append(cr)
+                    cand_feats_list.append(cf)
+                cand_rasters = torch.stack(cand_rasters_list, dim=0).to(device)  # (N, A, 1, H, W)
+                cand_feats = torch.stack(cand_feats_list, dim=0).to(device)      # (N, A, F)
+
+                logits_all, values_all = model((spatial_in, flat_in), cand_inputs=(cand_rasters, cand_feats))
 
                 # Mask invalid actions (vec + optional observer)
                 mask_vec = vec_env.valid_action_masks()  # List[List[int]] (N, A)
@@ -490,8 +543,18 @@ if __name__ == "__main__":
                 rewards = torch.tensor(rewards_np, device=device, dtype=torch.float32)
                 dones = torch.tensor(dones_np, device=device, dtype=torch.float32)
 
-                # Store step in buffer
-                buffer.add(spatial_tensor, flat_tensor, actions_vec, log_probs_vec, rewards, dones, values_vec)
+                # Store step in buffer (with masks limited to vectorized envs)
+                buffer.add(
+                    spatial_tensor,
+                    flat_tensor,
+                    actions_vec,
+                    log_probs_vec,
+                    rewards,
+                    dones,
+                    values_vec,
+                    valid_mask=mask[:NUM_ENVS],
+                    piece_ids=piece_ids_in[:NUM_ENVS],
+                )
 
                 # Logging trackers (avoid float64 on MPS; accumulate on CPU float32)
                 ep_returns += rewards.detach().cpu().to(torch.float32)
@@ -551,7 +614,25 @@ if __name__ == "__main__":
             # End for N_STEPS
 
             # Bootstrap value for last obs
-            last_logits, last_values = model((spatial_tensor, flat_tensor))
+            # Candidate tensors for last states
+            piece_ids_last = torch.as_tensor(getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
+            cand_rasters_list = []
+            cand_feats_list = []
+            try:
+                import numpy as _np
+            except Exception:
+                _np = None
+            for i in range(spatial_tensor.size(0)):
+                board_plane = spatial_tensor[i, 0].detach().cpu().numpy() if _np is not None else spatial_tensor[i, 0].detach().cpu().tolist()
+                pid = int(piece_ids_last[i].item())
+                r_i, f_i, _ = build_candidate_tensors_from_board_plane(board_plane, pid, pad_to=vec_env.action_space_n)
+                cr = torch.from_numpy(r_i) if _np is not None else torch.as_tensor(r_i, dtype=torch.float32)
+                cf = torch.from_numpy(f_i) if _np is not None else torch.as_tensor(f_i, dtype=torch.float32)
+                cand_rasters_list.append(cr)
+                cand_feats_list.append(cf)
+            cand_rasters_last = torch.stack(cand_rasters_list, dim=0).to(device)
+            cand_feats_last = torch.stack(cand_feats_list, dim=0).to(device)
+            last_logits, last_values = model((spatial_tensor, flat_tensor), cand_inputs=(cand_rasters_last, cand_feats_last))
             last_dones = torch.tensor([0.0] * NUM_ENVS, device=device)  # By construction, states here are non-terminal
             advantages, returns = buffer.compute_returns_and_advantages(
                 last_values=last_values, last_dones=last_dones, gamma=GAMMA, gae_lambda=GAE_LAMBDA
@@ -571,6 +652,11 @@ if __name__ == "__main__":
         b_log_probs = buffer.log_probs.reshape(batch_total)
         b_advantages = advantages.reshape(batch_total)
         b_returns = returns.reshape(batch_total)
+        # Flattened masks for PPO loss (A inferred from buffer)
+        if buffer.valid_masks is None:
+            raise RuntimeError("valid_masks missing in buffer; expected after collection.")
+        action_dim = int(buffer.valid_masks.shape[-1])
+        b_valid_masks = buffer.valid_masks.reshape(batch_total, action_dim)
 
         # Normalize advantages for stability
         adv_mean = b_advantages.mean()
@@ -601,8 +687,29 @@ if __name__ == "__main__":
                 mb_old_logp = b_log_probs[mb_inds]
                 mb_adv = b_advantages[mb_inds]
                 mb_ret = b_returns[mb_inds]
+                mb_masks = b_valid_masks[mb_inds]
+                # Recompute candidate tensors for minibatch from stored board plane (ch 0) and piece ids
+                mb_piece_ids = buffer.piece_ids.reshape(batch_total)[mb_inds]
+                try:
+                    import numpy as _np
+                except Exception:
+                    _np = None
+                crs = []
+                cfs = []
+                for i in range(mb_spatial.size(0)):
+                    bp = mb_spatial[i, 0].detach().cpu().numpy() if _np is not None else mb_spatial[i, 0].detach().cpu().tolist()
+                    pid = int(mb_piece_ids[i].item())
+                    r_i, f_i, _ = build_candidate_tensors_from_board_plane(bp, pid, pad_to=vec_env.action_space_n)
+                    cr = torch.from_numpy(r_i) if _np is not None else torch.as_tensor(r_i, dtype=torch.float32)
+                    cf = torch.from_numpy(f_i) if _np is not None else torch.as_tensor(f_i, dtype=torch.float32)
+                    crs.append(cr)
+                    cfs.append(cf)
+                mb_cand_rasters = torch.stack(crs, dim=0).to(device)
+                mb_cand_feats = torch.stack(cfs, dim=0).to(device)
 
-                new_logits, new_values = model((mb_spatial, mb_flat))
+                new_logits, new_values = model((mb_spatial, mb_flat), cand_inputs=(mb_cand_rasters, mb_cand_feats))
+                # Apply categorical mask before distribution
+                new_logits = new_logits.masked_fill(~mb_masks, -torch.inf)
                 dist = Categorical(logits=new_logits)
                 new_logp = dist.log_prob(mb_actions)
                 entropy = dist.entropy().mean()

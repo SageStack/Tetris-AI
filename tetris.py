@@ -173,6 +173,12 @@ class TetrisEnv:
         self.lines: int = 0
         self.level: int = 1
         self.game_over: bool = False
+        # Last-step derived info for richer observations
+        self.last_lines_cleared: int = 0
+        self.combo_count: int = 0
+        self.prev_clear_was_tetris: bool = False
+        self.b2b_active: bool = False
+        self.last_covered_holes_delta: int = 0
         self.recorder = TransitionRecorder()
         if record_path:
             self.enable_recording(record_path)
@@ -207,6 +213,9 @@ class TetrisEnv:
 
     def _lock_piece(self):
         mat = self._cur_matrix()
+        # Compute holes mask BEFORE placement to determine how many holes get covered
+        pre_board = self._clone_board()
+        pre_holes_mask = _compute_holes_mask(pre_board)
         for r in range(4):
             for c in range(4):
                 if mat[r][c]:
@@ -214,7 +223,32 @@ class TetrisEnv:
                     by = self.cur_y + r
                     if 0 <= by < BOARD_H and 0 <= bx < BOARD_W:
                         self.board[by][bx] = self.cur_id
+        # Compute covered holes delta: number of cells that were holes and are now filled by the locked piece
+        covered = 0
+        for r in range(4):
+            for c in range(4):
+                if mat[r][c]:
+                    bx = self.cur_x + c
+                    by = self.cur_y + r
+                    if 0 <= by < BOARD_H and 0 <= bx < BOARD_W:
+                        if pre_holes_mask[by][bx] == 1:
+                            covered += 1
+        self.last_covered_holes_delta = covered
+
         cleared = self._clear_lines()
+        # Track last-step line clear info and combo/b2b
+        self.last_lines_cleared = int(cleared)
+        if cleared > 0:
+            self.combo_count += 1
+        else:
+            self.combo_count = 0
+        # Simplified B2B: only Tetrises (4 lines) count in this environment
+        if cleared == 4 and self.prev_clear_was_tetris:
+            self.b2b_active = True
+        else:
+            self.b2b_active = False
+        # Update previous clear state (only True if this clear is a Tetris)
+        self.prev_clear_was_tetris = (cleared == 4)
         self.lines += cleared
         # Simple reward mapping; you can change this for RL
         # Standard-like but small-scale rewards
@@ -282,6 +316,11 @@ class TetrisEnv:
         self.lines = 0
         self.level = 1
         self.game_over = False
+        self.last_lines_cleared = 0
+        self.combo_count = 0
+        self.prev_clear_was_tetris = False
+        self.b2b_active = False
+        self.last_covered_holes_delta = 0
         self._spawn_new()
         return self.get_observation()
 
@@ -305,6 +344,11 @@ class TetrisEnv:
             "lines": self.lines,
             "level": self.level,
             "game_over": self.game_over,
+            # Last-step info for richer observations
+            "last_lines_cleared": self.last_lines_cleared,
+            "combo": self.combo_count,
+            "b2b": 1 if self.b2b_active else 0,
+            "last_covered_holes_delta": self.last_covered_holes_delta,
         }
         return obs
 
@@ -362,7 +406,13 @@ class TetrisEnv:
         # Here we do not apply automatic gravity inside step to keep it deterministic per action.
 
         done = self.game_over
-        info = {"lines_cleared": cleared, "locked": locked}
+        info = {
+            "lines_cleared": cleared,
+            "locked": locked,
+            "combo": int(self.combo_count),
+            "b2b": int(1 if self.b2b_active else 0),
+            "covered_holes_delta": int(self.last_covered_holes_delta),
+        }
         post_obs = self.get_observation()
         total_reward = reward_from_lock
 
@@ -493,6 +543,10 @@ def _serialize_obs(obs: Dict[str, Any]) -> Dict[str, Any]:
         "lines": int(obs["lines"]),
         "level": int(obs["level"]),
         "game_over": bool(obs["game_over"]),
+        "last_lines_cleared": int(obs.get("last_lines_cleared", 0)),
+        "combo": int(obs.get("combo", 0)),
+        "b2b": int(obs.get("b2b", 0)),
+        "last_covered_holes_delta": int(obs.get("last_covered_holes_delta", 0)),
     }
 
 
@@ -634,27 +688,88 @@ PLACEMENTS_BY_PIECE: Dict[int, List[Placement]] = _compute_piece_placements()
 MAX_ACTIONS_PER_PIECE: int = max(len(v) for v in PLACEMENTS_BY_PIECE.values())
 
 
+def _compute_column_heights(board_list: List[List[int]]) -> List[int]:
+    heights: List[int] = [0] * BOARD_W
+    for x in range(BOARD_W):
+        h = 0
+        for y in range(BOARD_H):
+            if board_list[y][x] != 0:
+                h = BOARD_H - y
+                break
+        heights[x] = h
+    return heights
+
+
+def _compute_holes_mask(board_list: List[List[int]]) -> List[List[int]]:
+    mask = [[0 for _ in range(BOARD_W)] for _ in range(BOARD_H)]
+    heights = _compute_column_heights(board_list)
+    for x in range(BOARD_W):
+        h = heights[x]
+        if h <= 0:
+            continue
+        top_y = BOARD_H - h
+        for y in range(top_y, BOARD_H):
+            if board_list[y][x] == 0:
+                mask[y][x] = 1
+    return mask
+
+
+def _compute_surface_mask(board_list: List[List[int]]) -> List[List[int]]:
+    mask = [[0 for _ in range(BOARD_W)] for _ in range(BOARD_H)]
+    for x in range(BOARD_W):
+        for y in range(BOARD_H):
+            if board_list[y][x] != 0:
+                mask[y][x] = 1
+                break
+    return mask
+
+
+def _compute_well_mask(board_list: List[List[int]]) -> List[List[int]]:
+    mask = [[0 for _ in range(BOARD_W)] for _ in range(BOARD_H)]
+    heights = _compute_column_heights(board_list)
+    for x in range(BOARD_W):
+        h_x = heights[x]
+        if x == 0:
+            m = heights[1]
+        elif x == BOARD_W - 1:
+            m = heights[BOARD_W - 2]
+        else:
+            m = min(heights[x - 1], heights[x + 1])
+        depth = m - h_x
+        if depth > 0:
+            y_start = BOARD_H - m
+            y_end = BOARD_H - h_x  # exclusive
+            for y in range(max(0, y_start), min(BOARD_H, y_end)):
+                # Only mark if this cell is currently empty
+                if board_list[y][x] == 0:
+                    mask[y][x] = 1
+    return mask
+
+
+def _compute_overhang_mask(board_list: List[List[int]], holes_mask: List[List[int]]) -> List[List[int]]:
+    mask = [[0 for _ in range(BOARD_W)] for _ in range(BOARD_H)]
+    for y in range(1, BOARD_H):  # start at row 1 to allow y-1 indexing
+        for x in range(BOARD_W):
+            if holes_mask[y][x] == 1 and board_list[y - 1][x] != 0:
+                mask[y - 1][x] = 1
+    return mask
+
+
+def _parity_plane_list() -> List[List[int]]:
+    return [[(r + c) & 1 for c in range(BOARD_W)] for r in range(BOARD_H)]
+
+
 def preprocess_observation(obs: Dict[str, Any]) -> Tuple[Any, Any]:
-    # spatial planes: (2, 20, 10) -> [board_binary, current_piece_binary]
+    # spatial planes: (7, 20, 10) -> [board_binary, current_piece, holes, surface, wells, overhang, parity]
     board = obs["board"]
     if np is None:
-        # ensure list
         board_list = board
-    else:
-        board_list = board.tolist() if isinstance(board, np.ndarray) else board
-
-    # plane 1: board locked cells as binary
-    if np is None:
+        # Plane 1: board
         plane_board = [[1 if cell != 0 else 0 for cell in row] for row in board_list]
-    else:
-        arr = np.array(board_list, dtype=np.int8)
-        plane_board = (arr != 0).astype(np.float32)
-
-    # plane 2: current falling piece
-    cur = obs["current"]
-    cur_x, cur_y = int(cur["x"]), int(cur["y"])
-    cur_mat = cur["matrix"]
-    if np is None:
+        # Plane 2: current piece
+        cur = obs["current"]
+        cur_x, cur_y = int(cur["x"]), int(cur["y"])
+        cur_mat = cur["matrix"]
         plane_cur = [[0 for _ in range(BOARD_W)] for _ in range(BOARD_H)]
         for r in range(4):
             for c in range(4):
@@ -662,8 +777,29 @@ def preprocess_observation(obs: Dict[str, Any]) -> Tuple[Any, Any]:
                     bx, by = cur_x + c, cur_y + r
                     if 0 <= bx < BOARD_W and 0 <= by < BOARD_H:
                         plane_cur[by][bx] = 1
-        spatial = [plane_board, plane_cur]
+        # Derived geometry
+        holes_mask = _compute_holes_mask(board_list)
+        surface_mask = _compute_surface_mask(board_list)
+        well_mask = _compute_well_mask(board_list)
+        overhang_mask = _compute_overhang_mask(board_list, holes_mask)
+        parity_plane = _parity_plane_list()
+        spatial = [
+            plane_board,
+            plane_cur,
+            holes_mask,
+            surface_mask,
+            well_mask,
+            overhang_mask,
+            parity_plane,
+        ]
     else:
+        board_list = board.tolist() if isinstance(board, np.ndarray) else board
+        arr = np.array(board_list, dtype=np.int8)
+        plane_board = (arr != 0).astype(np.float32)
+        # Plane 2: current piece
+        cur = obs["current"]
+        cur_x, cur_y = int(cur["x"]), int(cur["y"])
+        cur_mat = cur["matrix"]
         plane_cur = np.zeros((BOARD_H, BOARD_W), dtype=np.float32)
         for r in range(4):
             for c in range(4):
@@ -671,15 +807,125 @@ def preprocess_observation(obs: Dict[str, Any]) -> Tuple[Any, Any]:
                     bx, by = cur_x + c, cur_y + r
                     if 0 <= bx < BOARD_W and 0 <= by < BOARD_H:
                         plane_cur[by, bx] = 1.0
+        # Derived geometry (numpy)
+        # Holes mask
+        heights = np.zeros((BOARD_W,), dtype=np.int32)
+        for x in range(BOARD_W):
+            col = arr[:, x]
+            nz = np.nonzero(col)[0]
+            if nz.size > 0:
+                top_y = int(nz[0])
+                heights[x] = BOARD_H - top_y
+            else:
+                heights[x] = 0
+        holes_mask = np.zeros_like(plane_board, dtype=np.float32)
+        for x in range(BOARD_W):
+            h = int(heights[x])
+            if h <= 0:
+                continue
+            top_y = BOARD_H - h
+            col = arr[top_y:, x]
+            if col.size > 0:
+                holes = (col == 0).astype(np.float32)
+                holes_mask[top_y:, x] = holes
+        # Surface mask
+        surface_mask = np.zeros_like(plane_board, dtype=np.float32)
+        for x in range(BOARD_W):
+            col = arr[:, x]
+            nz = np.nonzero(col)[0]
+            if nz.size > 0:
+                surface_mask[int(nz[0]), x] = 1.0
+        # Well mask
+        well_mask = np.zeros_like(plane_board, dtype=np.float32)
+        for x in range(BOARD_W):
+            h_x = int(heights[x])
+            if x == 0:
+                m = int(heights[1])
+            elif x == BOARD_W - 1:
+                m = int(heights[BOARD_W - 2])
+            else:
+                m = int(min(heights[x - 1], heights[x + 1]))
+            depth = m - h_x
+            if depth > 0:
+                y_start = BOARD_H - m
+                y_end = BOARD_H - h_x
+                y_start = max(0, y_start)
+                y_end = min(BOARD_H, y_end)
+                # mark only empties as well cells
+                col_slice = arr[y_start:y_end, x]
+                if col_slice.size > 0:
+                    mask_slice = (col_slice == 0).astype(np.float32)
+                    well_mask[y_start:y_end, x] = mask_slice
+        # Overhang mask (filled directly above a hole)
+        overhang_mask = np.zeros_like(plane_board, dtype=np.float32)
+        # For y from 1..H-1, if holes_mask[y,x]==1 and arr[y-1,x]!=0 => overhang_mask[y-1,x]=1
+        if BOARD_H >= 2:
+            over_positions = (holes_mask[1:, :] == 1.0) & (arr[:-1, :] != 0)
+            overhang_mask[:-1, :] = over_positions.astype(np.float32)
+        # Parity plane
+        yy, xx = np.mgrid[0:BOARD_H, 0:BOARD_W]
+        parity_plane = ((yy + xx) & 1).astype(np.float32)
+
         spatial = np.stack([
             plane_board.astype(np.float32),
-            plane_cur.astype(np.float32)
-        ], axis=0)  # (2, H, W)
+            plane_cur.astype(np.float32),
+            holes_mask.astype(np.float32),
+            surface_mask.astype(np.float32),
+            well_mask.astype(np.float32),
+            overhang_mask.astype(np.float32),
+            parity_plane.astype(np.float32),
+        ], axis=0)
 
-    # flat vector: next queue (5x7 one-hot), hold (7 one-hot), can_hold (1)
+    # flat vector: next queue (5x7 one-hot), hold (7 one-hot), can_hold (1), plus 9 scalars
     next_q: List[int] = list(obs["next_queue"])[:5]
     hold_id: int = int(obs["hold"]) if obs["hold"] is not None else 0
     can_hold: bool = bool(obs["can_hold"])
+
+    # Scalars
+    last_lines = int(obs.get("last_lines_cleared", 0))
+    combo = int(obs.get("combo", 0))
+    is_b2b = int(obs.get("b2b", 0))
+
+    # Compute board-derived scalars: heights, agg_height, max_height, bumpiness, hole_count, tetris_ready
+    if np is None:
+        board_list = board_list  # already ensured
+        heights = _compute_column_heights(board_list)
+        agg_height = int(sum(heights))
+        max_height = int(max(heights) if heights else 0)
+        bumpiness = int(sum(abs(heights[i] - heights[i + 1]) for i in range(BOARD_W - 1)))
+        holes_mask_l = _compute_holes_mask(board_list)
+        hole_count = int(sum(sum(row) for row in holes_mask_l))
+        # tetris_ready: any well depth >= 4
+        well_depths = []
+        for x in range(BOARD_W):
+            h_x = heights[x]
+            if x == 0:
+                m = heights[1]
+            elif x == BOARD_W - 1:
+                m = heights[BOARD_W - 2]
+            else:
+                m = min(heights[x - 1], heights[x + 1])
+            well_depths.append(max(0, m - h_x))
+        tetris_ready = 1 if any(d >= 4 for d in well_depths) else 0
+        covered_holes_delta_last = int(obs.get("last_covered_holes_delta", 0))
+    else:
+        heights_list = heights.tolist() if 'heights' in locals() else _compute_column_heights(board_list)
+        agg_height = int(sum(heights_list))
+        max_height = int(max(heights_list) if heights_list else 0)
+        bumpiness = int(sum(abs(heights_list[i] - heights_list[i + 1]) for i in range(BOARD_W - 1)))
+        hole_count = int(holes_mask.sum()) if 'holes_mask' in locals() and isinstance(holes_mask, np.ndarray) else int(sum(sum(row) for row in _compute_holes_mask(board_list)))
+        well_depths = []
+        for x in range(BOARD_W):
+            h_x = int(heights_list[x])
+            if x == 0:
+                m = int(heights_list[1])
+            elif x == BOARD_W - 1:
+                m = int(heights_list[BOARD_W - 2])
+            else:
+                m = int(min(heights_list[x - 1], heights_list[x + 1]))
+            well_depths.append(max(0, m - h_x))
+        tetris_ready = 1 if any(d >= 4 for d in well_depths) else 0
+        covered_holes_delta_last = int(obs.get("last_covered_holes_delta", 0))
 
     if np is None:
         next_oh = []
@@ -691,7 +937,18 @@ def preprocess_observation(obs: Dict[str, Any]) -> Tuple[Any, Any]:
         hold_oh = [0]*7
         if 1 <= hold_id <= 7:
             hold_oh[hold_id-1] = 1
-        flat = next_oh + hold_oh + [1 if can_hold else 0]
+        extra_scalars = [
+            last_lines,
+            combo,
+            is_b2b,
+            agg_height,
+            max_height,
+            bumpiness,
+            hole_count,
+            covered_holes_delta_last,
+            int(tetris_ready),
+        ]
+        flat = next_oh + hold_oh + [1 if can_hold else 0] + extra_scalars
     else:
         next_oh = np.zeros((5, 7), dtype=np.float32)
         for i, pid in enumerate(next_q):
@@ -700,9 +957,190 @@ def preprocess_observation(obs: Dict[str, Any]) -> Tuple[Any, Any]:
         hold_oh = np.zeros((7,), dtype=np.float32)
         if 1 <= hold_id <= 7:
             hold_oh[hold_id-1] = 1.0
-        flat = np.concatenate([next_oh.reshape(-1), hold_oh, np.array([1.0 if can_hold else 0.0], dtype=np.float32)])
+        extra = np.array([
+            float(last_lines),
+            float(combo),
+            float(is_b2b),
+            float(agg_height),
+            float(max_height),
+            float(bumpiness),
+            float(hole_count),
+            float(covered_holes_delta_last),
+            float(tetris_ready),
+        ], dtype=np.float32)
+        flat = np.concatenate([
+            next_oh.reshape(-1),
+            hold_oh,
+            np.array([1.0 if can_hold else 0.0], dtype=np.float32),
+            extra,
+        ])
 
     return spatial, flat
+
+
+# -----------------------------
+# Candidate Simulation Helpers
+# -----------------------------
+
+def _board_collides(board_bin: List[List[int]], mat: List[List[int]], x: int, y: int) -> bool:
+    for r in range(4):
+        for c in range(4):
+            if mat[r][c]:
+                bx = x + c
+                by = y + r
+                if bx < 0 or bx >= BOARD_W or by < 0 or by >= BOARD_H:
+                    return True
+                if board_bin[by][bx] != 0:
+                    return True
+    return False
+
+
+def _hard_drop_y_on_board(board_bin: List[List[int]], mat: List[List[int]], x: int) -> Optional[int]:
+    # Drop from y=0 down until collision would occur on next step
+    # If collides at y=0 immediately and cannot move down, still try to find a non-colliding y >= 0
+    y = 0
+    # If immediately colliding at y=0 and also at y=1 etc., there is no valid landing
+    # We'll find first y where not colliding; if none, return None
+    # First, find first non-colliding y
+    while y < BOARD_H and _board_collides(board_bin, mat, x, y):
+        y += 1
+    if y >= BOARD_H:
+        return None
+    # Now descend until next step collides
+    while y + 1 < BOARD_H and not _board_collides(board_bin, mat, x, y + 1):
+        y += 1
+    return y
+
+
+def _apply_piece_on_board(board_bin: List[List[int]], mat: List[List[int]], x: int, y: int) -> List[List[int]]:
+    newb = [row[:] for row in board_bin]
+    for r in range(4):
+        for c in range(4):
+            if mat[r][c]:
+                bx = x + c
+                by = y + r
+                if 0 <= bx < BOARD_W and 0 <= by < BOARD_H:
+                    newb[by][bx] = 1
+    return newb
+
+
+def _clear_lines_on_board(board_bin: List[List[int]]) -> Tuple[List[List[int]], int]:
+    new_rows = [row[:] for row in board_bin if any(cell == 0 for cell in row)]
+    cleared = BOARD_H - len(new_rows)
+    while len(new_rows) < BOARD_H:
+        new_rows.insert(0, [0] * BOARD_W)
+    return new_rows, cleared
+
+
+def _well_depths_from_heights(heights: List[int]) -> List[int]:
+    depths: List[int] = []
+    for x in range(BOARD_W):
+        h_x = heights[x]
+        if x == 0:
+            m = heights[1]
+        elif x == BOARD_W - 1:
+            m = heights[BOARD_W - 2]
+        else:
+            m = min(heights[x - 1], heights[x + 1])
+        depths.append(max(0, m - h_x))
+    return depths
+
+
+def build_candidate_tensors_from_board_plane(board_plane: Any, piece_id: int, pad_to: int = MAX_ACTIONS_PER_PIECE) -> Tuple[Any, Any, int]:
+    """Compute candidate rasters and features for the given board occupancy and current piece.
+
+    Returns (rasters, feats, K) where
+      - rasters: (pad_to, 1, H, W) float32
+      - feats:   (pad_to, F) float32 with F=6
+      - K: number of valid candidates for this piece (<= pad_to)
+    """
+    F_DIM = 6  # [lines_cleared, holes_after, agg_height_after, bumpiness_after, well_depth_max_after, covered_holes]
+
+    # Normalize board to list[List[int]] binary
+    if np is not None and hasattr(board_plane, "astype"):
+        b = (board_plane.astype("uint8")).tolist()
+    else:
+        b = [[1 if cell else 0 for cell in row] for row in board_plane]
+
+    placements = PLACEMENTS_BY_PIECE[int(piece_id)]
+    K = len(placements)
+    H, W = BOARD_H, BOARD_W
+
+    if np is not None:
+        rasters = np.zeros((pad_to, 1, H, W), dtype=np.float32)
+        feats = np.zeros((pad_to, F_DIM), dtype=np.float32)
+    else:
+        rasters = [[[ [0.0 for _ in range(W)] for _ in range(H) ]] for _ in range(pad_to)]
+        feats = [[0.0 for _ in range(F_DIM)] for _ in range(pad_to)]
+
+    pre_holes_mask = _compute_holes_mask(b)
+
+    for i, plc in enumerate(placements):
+        mat = PIECES[piece_id][plc.rot]
+        y = _hard_drop_y_on_board(b, mat, plc.x)
+        if y is None:
+            # Unreachable; leave zeros
+            continue
+        # piece raster at landing
+        if np is not None:
+            pr = np.zeros((H, W), dtype=np.float32)
+            for r in range(4):
+                for c in range(4):
+                    if mat[r][c]:
+                        bx, by = plc.x + c, y + r
+                        if 0 <= bx < W and 0 <= by < H:
+                            pr[by, bx] = 1.0
+            rasters[i, 0] = pr
+        else:
+            pr = [[0.0 for _ in range(W)] for _ in range(H)]
+            for r in range(4):
+                for c in range(4):
+                    if mat[r][c]:
+                        bx, by = plc.x + c, y + r
+                        if 0 <= bx < W and 0 <= by < H:
+                            pr[by][bx] = 1.0
+            rasters[i][0] = pr
+
+        # apply piece, clear lines
+        b_after = _apply_piece_on_board(b, mat, plc.x, y)
+        b_after, lines_cleared = _clear_lines_on_board(b_after)
+
+        # covered holes: how many previously hole cells are now filled by piece
+        covered = 0
+        for r in range(4):
+            for c in range(4):
+                if mat[r][c]:
+                    bx, by = plc.x + c, y + r
+                    if 0 <= bx < W and 0 <= by < H:
+                        if pre_holes_mask[by][bx] == 1:
+                            covered += 1
+
+        heights = _compute_column_heights(b_after)
+        agg_height = sum(heights)
+        bumpiness = sum(abs(heights[j] - heights[j + 1]) for j in range(W - 1))
+        well_depth_max = max(_well_depths_from_heights(heights)) if W >= 2 else 0
+        holes_after = sum(sum(row) for row in _compute_holes_mask(b_after))
+
+        if np is not None:
+            feats[i] = np.array([
+                float(lines_cleared),
+                float(holes_after),
+                float(agg_height),
+                float(bumpiness),
+                float(well_depth_max),
+                float(covered),
+            ], dtype=np.float32)
+        else:
+            feats[i] = [
+                float(lines_cleared),
+                float(holes_after),
+                float(agg_height),
+                float(bumpiness),
+                float(well_depth_max),
+                float(covered),
+            ]
+
+    return rasters, feats, K
 
 
 class TetrisEnvWrapper:
@@ -831,6 +1269,9 @@ class TetrisEnvWrapper:
         info = {
             "locked": locked,
             "lines_cleared": info_last.get("lines_cleared", 0),
+            "combo": info_last.get("combo", 0),
+            "b2b": info_last.get("b2b", 0),
+            "covered_holes_delta": info_last.get("covered_holes_delta", 0),
             "action_executed": {
                 "rot": placement.rot,
                 "x": placement.x,
@@ -846,6 +1287,9 @@ class TetrisEnvWrapper:
     def observe(self):
         obs = self.env.get_observation()
         return preprocess_observation(obs) if self.preprocess else obs
+
+    def current_piece_id(self) -> int:
+        return int(self.env.cur_id)
 
     # expose some underlying env data
     @property
@@ -886,6 +1330,9 @@ class SyncVecTetris:
 
     def valid_action_masks(self) -> List[List[int]]:
         return [env.valid_action_mask() for env in self.envs]
+
+    def current_piece_ids(self) -> List[int]:
+        return [env.current_piece_id() for env in self.envs]
 
     def close(self):
         pass
@@ -933,6 +1380,11 @@ class SubprocVecTetris:
             remote.send(("mask", None))
         return [remote.recv() for remote in self.remotes]
 
+    def current_piece_ids(self) -> List[int]:
+        for remote in self.remotes:
+            remote.send(("pid", None))
+        return [remote.recv() for remote in self.remotes]
+
     def close(self):
         for remote in self.remotes:
             try:
@@ -955,6 +1407,8 @@ def _worker(remote, seed: Optional[int], preprocess: bool):
             remote.send((ob, r, d, info))
         elif cmd == "mask":
             remote.send(env.valid_action_mask())
+        elif cmd == "pid":
+            remote.send(env.current_piece_id())
         elif cmd == "close":
             remote.close()
             break
