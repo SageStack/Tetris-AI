@@ -8,7 +8,7 @@ Actor-Critic model, optimizer, and TensorBoard SummaryWriter.
 from __future__ import annotations
 
 import os
-from typing import List, Sequence, Tuple
+from typing import List, Sequence, Tuple, Optional
 
 import torch
 from torch import Tensor
@@ -22,6 +22,7 @@ import uuid
 import json
 import signal
 import atexit
+import shutil
 from tetris import make_vec_env, TetrisEnvWrapper, BOARD_W, BOARD_H, build_candidate_tensors_from_board_plane
 from actor_critic import build_default_model
 
@@ -460,16 +461,17 @@ if __name__ == "__main__":
     best_ckpt_path = os.path.join(run_dir, "best_model.pt")
     last_ckpt_path = os.path.join(run_dir, "last_model.pt")
 
-    def save_checkpoint(path: str, tag: str, extra: dict | None = None) -> None:
+    def save_checkpoint(path: str, tag: str, extra: Optional[dict] = None) -> None:
         """Save a checkpoint with model, optimizer, and metadata."""
         try:
+            step_safe = int(globals().get('global_step_counter', 0))
             payload = {
                 "model_state": model.state_dict(),
                 "optimizer_state": optimizer.state_dict(),
                 "action_space_n": int(vec_env.action_space_n),
                 "in_channels": int(inferred_in_channels),
                 "flat_dim": int(inferred_flat_dim),
-                "global_step": int(global_step_counter),
+                "global_step": step_safe,
                 "timestamp": time.time(),
                 "tag": str(tag),
             }
@@ -480,6 +482,53 @@ if __name__ == "__main__":
             print(f"[checkpoint] Saved {tag} -> {path}")
         except Exception as e:
             print(f"[checkpoint] Failed to save {tag} at {path}: {e}")
+
+    def export_inference_checkpoint(path: str, tag: str = "export") -> None:
+        """Save a minimal checkpoint for inference (weights + dims only)."""
+        try:
+            step_safe = int(globals().get('global_step_counter', 0))
+            payload = {
+                "model_state": model.state_dict(),
+                "action_space_n": int(vec_env.action_space_n),
+                "in_channels": int(inferred_in_channels),
+                "flat_dim": int(inferred_flat_dim),
+                "global_step": step_safe,
+                "timestamp": time.time(),
+                "tag": str(tag),
+                "export": True,
+            }
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            torch.save(payload, path)
+            print(f"[export] Saved inference weights -> {path}")
+        except Exception as e:
+            print(f"[export] Failed to save inference weights at {path}: {e}")
+
+    def prompt_save_path(default_name: str = "export_model.pt") -> Optional[str]:
+        """Open a save dialog to choose where to store weights. Returns path or None."""
+        try:
+            from tkinter import Tk, filedialog  # type: ignore
+            root = Tk()
+            root.withdraw()
+            initialdir = run_dir if os.path.isdir(run_dir) else os.getcwd()
+            path = filedialog.asksaveasfilename(
+                title="Save model weights",
+                defaultextension=".pt",
+                initialdir=initialdir,
+                initialfile=default_name,
+                filetypes=[("PyTorch", "*.pt *.pth"), ("All Files", "*.*")],
+            )
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            return path if path else None
+        except Exception as e:
+            # Fallback: timestamped file in run_dir
+            fallback = os.path.join(
+                run_dir, f"export-{time.strftime('%Y%m%d-%H%M%S')}.pt")
+            print(
+                f"[export] File dialog unavailable ({e}); using fallback: {fallback}")
+            return fallback
 
     # Try to always persist a last snapshot on interpreter exit
     @atexit.register
@@ -520,205 +569,212 @@ if __name__ == "__main__":
     ep_returns = torch.zeros(NUM_ENVS, dtype=torch.float32)
     ep_lengths = torch.zeros(NUM_ENVS, dtype=torch.int64)
     # Aggregated episode returns for sweep metrics
-    all_episode_returns: list[float] = []
-    recent_returns_window: list[float] = []
+    all_episode_returns: List[float] = []
+    recent_returns_window: List[float] = []
     recent_window_size = 100
 
     try:
         while global_step_counter < TOTAL_TIMESTEPS:
-        # Rollout N_STEPS
-        model.eval()
-        buffer.clear()
-        with torch.no_grad():
-            for t in range(N_STEPS):
-                # Build combined batch including observer (if enabled)
-                if render_enabled and observer_env is not None:
-                    # Convert observer obs to tensors and append as batch=1
-                    obs_spatial, obs_flat = observer_obs
-                    obs_spatial_t = torch.as_tensor(
-                        obs_spatial, device=device, dtype=torch.float32).unsqueeze(0)
-                    obs_flat_t = torch.as_tensor(
-                        obs_flat, device=device, dtype=torch.float32).unsqueeze(0)
-                    spatial_in = torch.cat(
-                        [spatial_tensor, obs_spatial_t], dim=0)
-                    flat_in = torch.cat([flat_tensor, obs_flat_t], dim=0)
-                    # Piece IDs for vector + observer
-                    piece_ids_vec = torch.as_tensor(
-                        getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
-                    piece_id_obs = torch.as_tensor(
-                        [observer_env.current_piece_id()], device=device, dtype=torch.long)
-                    piece_ids_in = torch.cat(
-                        [piece_ids_vec, piece_id_obs], dim=0)
-                else:
-                    spatial_in, flat_in = spatial_tensor, flat_tensor
-                    piece_ids_in = torch.as_tensor(
-                        getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
-
-                # Forward pass on combined batch
-                # Build candidate tensors per sample from board plane (channel 0) and piece id
-                N_combined = spatial_in.size(0)
-                action_dim = vec_env.action_space_n
-                H, W = spatial_in.size(-2), spatial_in.size(-1)
-                try:
-                    import numpy as _np
-                except Exception:
-                    _np = None
-                cand_rasters_list = []
-                cand_feats_list = []
-                for i in range(N_combined):
-                    board_plane = spatial_in[i, 0].detach().cpu().numpy(
-                    ) if _np is not None else spatial_in[i, 0].detach().cpu().tolist()
-                    pid = int(piece_ids_in[i].item())
-                    rasters_i, feats_i, _ = build_candidate_tensors_from_board_plane(
-                        board_plane, pid, pad_to=action_dim)
-                    if _np is None:
-                        # Convert lists to tensors
-                        cr = torch.as_tensor(rasters_i, dtype=torch.float32)
-                        cf = torch.as_tensor(feats_i, dtype=torch.float32)
+            # Rollout N_STEPS
+            model.eval()
+            buffer.clear()
+            with torch.no_grad():
+                for t in range(N_STEPS):
+                    # Build combined batch including observer (if enabled)
+                    if render_enabled and observer_env is not None:
+                        # Convert observer obs to tensors and append as batch=1
+                        obs_spatial, obs_flat = observer_obs
+                        obs_spatial_t = torch.as_tensor(
+                            obs_spatial, device=device, dtype=torch.float32).unsqueeze(0)
+                        obs_flat_t = torch.as_tensor(
+                            obs_flat, device=device, dtype=torch.float32).unsqueeze(0)
+                        spatial_in = torch.cat(
+                            [spatial_tensor, obs_spatial_t], dim=0)
+                        flat_in = torch.cat([flat_tensor, obs_flat_t], dim=0)
+                        # Piece IDs for vector + observer
+                        piece_ids_vec = torch.as_tensor(
+                            getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
+                        piece_id_obs = torch.as_tensor(
+                            [observer_env.current_piece_id()], device=device, dtype=torch.long)
+                        piece_ids_in = torch.cat(
+                            [piece_ids_vec, piece_id_obs], dim=0)
                     else:
-                        cr = torch.from_numpy(rasters_i)
-                        cf = torch.from_numpy(feats_i)
-                    cand_rasters_list.append(cr)
-                    cand_feats_list.append(cf)
-                cand_rasters = torch.stack(cand_rasters_list, dim=0).to(
-                    device)  # (N, A, 1, H, W)
-                cand_feats = torch.stack(cand_feats_list, dim=0).to(
-                    device)      # (N, A, F)
+                        spatial_in, flat_in = spatial_tensor, flat_tensor
+                        piece_ids_in = torch.as_tensor(
+                            getattr(vec_env, "current_piece_ids")(), device=device, dtype=torch.long)
 
-                logits_all, values_all = model(
-                    (spatial_in, flat_in), cand_inputs=(cand_rasters, cand_feats))
+                    # Forward pass on combined batch
+                    # Build candidate tensors per sample from board plane (channel 0) and piece id
+                    N_combined = spatial_in.size(0)
+                    action_dim = vec_env.action_space_n
+                    H, W = spatial_in.size(-2), spatial_in.size(-1)
+                    try:
+                        import numpy as _np
+                    except Exception:
+                        _np = None
+                    cand_rasters_list = []
+                    cand_feats_list = []
+                    for i in range(N_combined):
+                        board_plane = spatial_in[i, 0].detach().cpu().numpy(
+                        ) if _np is not None else spatial_in[i, 0].detach().cpu().tolist()
+                        pid = int(piece_ids_in[i].item())
+                        rasters_i, feats_i, _ = build_candidate_tensors_from_board_plane(
+                            board_plane, pid, pad_to=action_dim)
+                        if _np is None:
+                            # Convert lists to tensors
+                            cr = torch.as_tensor(rasters_i, dtype=torch.float32)
+                            cf = torch.as_tensor(feats_i, dtype=torch.float32)
+                        else:
+                            cr = torch.from_numpy(rasters_i)
+                            cf = torch.from_numpy(feats_i)
+                        cand_rasters_list.append(cr)
+                        cand_feats_list.append(cf)
+                    cand_rasters = torch.stack(cand_rasters_list, dim=0).to(
+                        device)  # (N, A, 1, H, W)
+                    cand_feats = torch.stack(cand_feats_list, dim=0).to(
+                        device)      # (N, A, F)
 
-                # Mask invalid actions (vec + optional observer)
-                # List[List[int]] (N, A)
-                mask_vec = vec_env.valid_action_masks()
-                if render_enabled and observer_env is not None:
-                    mask_obs = observer_env.valid_action_mask()
-                    mask_combined = mask_vec + [mask_obs]
-                else:
-                    mask_combined = mask_vec
-                mask = torch.tensor(
-                    mask_combined, device=device, dtype=torch.bool)
-                logits_all = logits_all.masked_fill(~mask, -torch.inf)
+                    logits_all, values_all = model(
+                        (spatial_in, flat_in), cand_inputs=(cand_rasters, cand_feats))
 
-                # Sample actions over combined
-                dist_all = Categorical(logits=logits_all)
-                actions_all = dist_all.sample()            # (N [+ 1],)
-                log_probs_all = dist_all.log_prob(actions_all)
+                    # Mask invalid actions (vec + optional observer)
+                    # List[List[int]] (N, A)
+                    mask_vec = vec_env.valid_action_masks()
+                    if render_enabled and observer_env is not None:
+                        mask_obs = observer_env.valid_action_mask()
+                        mask_combined = mask_vec + [mask_obs]
+                    else:
+                        mask_combined = mask_vec
+                    mask = torch.tensor(
+                        mask_combined, device=device, dtype=torch.bool)
+                    logits_all = logits_all.masked_fill(~mask, -torch.inf)
 
-                # Slice vec vs observer
-                actions_vec = actions_all[:NUM_ENVS]
-                log_probs_vec = log_probs_all[:NUM_ENVS]
-                values_vec = values_all[:NUM_ENVS]
+                    # Sample actions over combined
+                    dist_all = Categorical(logits=logits_all)
+                    actions_all = dist_all.sample()            # (N [+ 1],)
+                    log_probs_all = dist_all.log_prob(actions_all)
 
-                # Step training environments
-                next_obs_list, rewards_np, dones_np, infos_list = vec_env.step(
-                    actions_vec.detach().cpu().tolist())
+                    # Slice vec vs observer
+                    actions_vec = actions_all[:NUM_ENVS]
+                    log_probs_vec = log_probs_all[:NUM_ENVS]
+                    values_vec = values_all[:NUM_ENVS]
 
-                # Step observer environment and render (do not store/learn from it)
-                if render_enabled and observer_env is not None:
-                    import pygame  # type: ignore
-                    action_obs = int(actions_all[-1].item())
-                    observer_obs, observer_reward, observer_done, observer_info = observer_env.step(
-                        action_obs)
-                    # Draw
-                    if screen is not None:
-                        observer_env.render(screen, tile=tile_size)
-                        # Lightweight HUD: show current run id in the top-left
-                        try:
-                            run_id = os.path.basename(run_dir)
-                        except Exception:
-                            run_id = "run"
-                        if 'hud_font' in locals() and hud_font is not None:
-                            text_surface = hud_font.render(
-                                f"Run: {run_id}", True, (230, 230, 230))
-                            screen.blit(text_surface, (10, 6))
-                        # process events so the window stays responsive
-                        for event in pygame.event.get():
-                            if event.type == pygame.QUIT:
-                                render_enabled = False
-                        pygame.display.flip()
-                        if clock is not None:
-                            clock.tick(30)
-                    # Reset observer episode if done
-                    if observer_done:
-                        observer_obs = observer_env.reset()
+                    # Step training environments
+                    next_obs_list, rewards_np, dones_np, infos_list = vec_env.step(
+                        actions_vec.detach().cpu().tolist())
 
-                # Convert rewards/dones
-                rewards = torch.tensor(
-                    rewards_np, device=device, dtype=torch.float32)
-                dones = torch.tensor(
-                    dones_np, device=device, dtype=torch.float32)
+                    # Step observer environment and render (do not store/learn from it)
+                    if render_enabled and observer_env is not None:
+                        import pygame  # type: ignore
+                        action_obs = int(actions_all[-1].item())
+                        observer_obs, observer_reward, observer_done, observer_info = observer_env.step(
+                            action_obs)
+                        # Draw
+                        if screen is not None:
+                            observer_env.render(screen, tile=tile_size)
+                            # Lightweight HUD: show current run id in the top-left
+                            try:
+                                run_id = os.path.basename(run_dir)
+                            except Exception:
+                                run_id = "run"
+                            if 'hud_font' in locals() and hud_font is not None:
+                                text_surface = hud_font.render(
+                                    f"Run: {run_id}", True, (230, 230, 230))
+                                screen.blit(text_surface, (10, 6))
+                            # process events so the window stays responsive
+                            for event in pygame.event.get():
+                                if event.type == pygame.QUIT:
+                                    render_enabled = False
+                                elif event.type == pygame.KEYDOWN:
+                                    # Hotkey: F5 or S -> Save As (inference-only weights)
+                                    if event.key in (pygame.K_F5, pygame.K_s):
+                                        default_name = f"export-{timestamp}.pt" if 'timestamp' in locals() else "export_model.pt"
+                                        path = prompt_save_path(default_name=default_name)
+                                        if path:
+                                            export_inference_checkpoint(path, tag="manual_export")
+                            pygame.display.flip()
+                            if clock is not None:
+                                clock.tick(30)
+                        # Reset observer episode if done
+                        if observer_done:
+                            observer_obs = observer_env.reset()
 
-                # Store step in buffer (with masks limited to vectorized envs)
-                buffer.add(
-                    spatial_tensor,
-                    flat_tensor,
-                    actions_vec,
-                    log_probs_vec,
-                    rewards,
-                    dones,
-                    values_vec,
-                    valid_mask=mask[:NUM_ENVS],
-                    piece_ids=piece_ids_in[:NUM_ENVS],
-                )
+                    # Convert rewards/dones
+                    rewards = torch.tensor(
+                        rewards_np, device=device, dtype=torch.float32)
+                    dones = torch.tensor(
+                        dones_np, device=device, dtype=torch.float32)
 
-                # Logging trackers (avoid float64 on MPS; accumulate on CPU float32)
-                ep_returns += rewards.detach().cpu().to(torch.float32)
-                ep_lengths += 1
+                    # Store step in buffer (with masks limited to vectorized envs)
+                    buffer.add(
+                        spatial_tensor,
+                        flat_tensor,
+                        actions_vec,
+                        log_probs_vec,
+                        rewards,
+                        dones,
+                        values_vec,
+                        valid_mask=mask[:NUM_ENVS],
+                        piece_ids=piece_ids_in[:NUM_ENVS],
+                    )
 
-                # Reset envs that are done; log episode info
-                for i, done in enumerate(dones_np):
-                    if done:
-                        # Log episodic stats
-                        try:
-                            writer.add_scalar(
-                                "charts/episodic_return", ep_returns[i].item(), global_step_counter)
-                            writer.add_scalar(
-                                "charts/episodic_length", ep_lengths[i].item(), global_step_counter)
-                        except Exception:
+                    # Logging trackers (avoid float64 on MPS; accumulate on CPU float32)
+                    ep_returns += rewards.detach().cpu().to(torch.float32)
+                    ep_lengths += 1
+
+                    # Reset envs that are done; log episode info
+                    for i, done in enumerate(dones_np):
+                        if done:
+                            # Log episodic stats
+                            try:
+                                writer.add_scalar(
+                                    "charts/episodic_return", ep_returns[i].item(), global_step_counter)
+                                writer.add_scalar(
+                                    "charts/episodic_length", ep_lengths[i].item(), global_step_counter)
+                            except Exception:
+                                pass
+                            # Track for metrics
+                            ret_val = float(ep_returns[i].item())
+                            all_episode_returns.append(ret_val)
+                            recent_returns_window.append(ret_val)
+                            if len(recent_returns_window) > recent_window_size:
+                                recent_returns_window.pop(0)
+                            # Reset trackers for that env
+                            ep_returns[i] = 0.0
+                            ep_lengths[i] = 0
+
+                    # Prepare next state; reset any done envs to continue rollout
+                    for i, d in enumerate(dones_np):
+                        if d:
+                            # Reset just that env by calling underlying env reset
+                            # Subproc/sync API expects list of seeds or none; we can perform individual resets
+                            # by creating a fresh observation via vec_env.reset() is all-envs; but we only want one.
+                            # Workaround: call step with noop until wrapper returns a fresh episode on next step.
+                            # However, our wrapper doesn't auto-reset; use batched reset across all envs when any done.
+                            # Simpler approach: call reset() for all envs and keep others' obs unchanged.
                             pass
-                        # Track for metrics
-                        ret_val = float(ep_returns[i].item())
-                        all_episode_returns.append(ret_val)
-                        recent_returns_window.append(ret_val)
-                        if len(recent_returns_window) > recent_window_size:
-                            recent_returns_window.pop(0)
-                        # Reset trackers for that env
-                        ep_returns[i] = 0.0
-                        ep_lengths[i] = 0
 
-                # Prepare next state; reset any done envs to continue rollout
-                for i, d in enumerate(dones_np):
-                    if d:
-                        # Reset just that env by calling underlying env reset
-                        # Subproc/sync API expects list of seeds or none; we can perform individual resets
-                        # by creating a fresh observation via vec_env.reset() is all-envs; but we only want one.
-                        # Workaround: call step with noop until wrapper returns a fresh episode on next step.
-                        # However, our wrapper doesn't auto-reset; use batched reset across all envs when any done.
-                        # Simpler approach: call reset() for all envs and keep others' obs unchanged.
-                        pass
+                    # Efficiently reset only done envs by directly querying wrapper states
+                    # via a follow-up reset call with seeds per-env. We need updated obs list next.
+                    # We'll rebuild obs_list applying resets where done.
+                    new_obs_list: List[Tuple[object, object]] = list(next_obs_list)
+                    if any(dones_np):
+                        reset_indices = [i for i, d in enumerate(dones_np) if d]
+                        # Prefer per-env reset when using SyncVecTetris
+                        if hasattr(vec_env, "envs"):
+                            for idx in reset_indices:
+                                new_obs_list[idx] = vec_env.envs[idx].reset()
+                        else:
+                            # Fallback: if partial reset unavailable, reset all envs
+                            # and continue with those fresh observations.
+                            new_obs_list = vec_env.reset()
 
-                # Efficiently reset only done envs by directly querying wrapper states
-                # via a follow-up reset call with seeds per-env. We need updated obs list next.
-                # We'll rebuild obs_list applying resets where done.
-                new_obs_list: List[Tuple[object, object]] = list(next_obs_list)
-                if any(dones_np):
-                    reset_indices = [i for i, d in enumerate(dones_np) if d]
-                    # Prefer per-env reset when using SyncVecTetris
-                    if hasattr(vec_env, "envs"):
-                        for idx in reset_indices:
-                            new_obs_list[idx] = vec_env.envs[idx].reset()
-                    else:
-                        # Fallback: if partial reset unavailable, reset all envs
-                        # and continue with those fresh observations.
-                        new_obs_list = vec_env.reset()
+                    # Update current state tensors
+                    spatial_tensor, flat_tensor = batch_obs_to_tensors(
+                        new_obs_list, device)
 
-                # Update current state tensors
-                spatial_tensor, flat_tensor = batch_obs_to_tensors(
-                    new_obs_list, device)
-
-                # Increase global step count
-                global_step_counter += NUM_ENVS
+                    # Increase global step count
+                    global_step_counter += NUM_ENVS
 
             # End for N_STEPS
 
@@ -755,112 +811,113 @@ if __name__ == "__main__":
                 last_values=last_values, last_dones=last_dones, gamma=GAMMA, gae_lambda=GAE_LAMBDA
             )
 
-        # At this point: buffer holds transitions; advantages/returns are computed.
-        # -----------------------------
-        # PPO Learning Phase
-        # -----------------------------
-        # Part 1: Flatten rollout into a single batch and normalize advantages
-        T, N = buffer.n_steps, buffer.num_envs
-        batch_total = T * N
+            # At this point: buffer holds transitions; advantages/returns are computed.
+            # -----------------------------
+            # PPO Learning Phase
+            # -----------------------------
+            # Part 1: Flatten rollout into a single batch and normalize advantages
+            T, N = buffer.n_steps, buffer.num_envs
+            batch_total = T * N
 
-        b_spatial_obs = buffer.spatial_obs.reshape(batch_total, *spatial_shape)
-        b_flat_obs = buffer.flat_obs.reshape(batch_total, flat_dim)
-        b_actions = buffer.actions.reshape(batch_total)
-        b_log_probs = buffer.log_probs.reshape(batch_total)
-        b_advantages = advantages.reshape(batch_total)
-        b_returns = returns.reshape(batch_total)
-        # Flattened masks for PPO loss (A inferred from buffer)
-        if buffer.valid_masks is None:
-            raise RuntimeError(
-                "valid_masks missing in buffer; expected after collection.")
-        action_dim = int(buffer.valid_masks.shape[-1])
-        b_valid_masks = buffer.valid_masks.reshape(batch_total, action_dim)
+            b_spatial_obs = buffer.spatial_obs.reshape(
+                batch_total, *spatial_shape)
+            b_flat_obs = buffer.flat_obs.reshape(batch_total, flat_dim)
+            b_actions = buffer.actions.reshape(batch_total)
+            b_log_probs = buffer.log_probs.reshape(batch_total)
+            b_advantages = advantages.reshape(batch_total)
+            b_returns = returns.reshape(batch_total)
+            # Flattened masks for PPO loss (A inferred from buffer)
+            if buffer.valid_masks is None:
+                raise RuntimeError(
+                    "valid_masks missing in buffer; expected after collection.")
+            action_dim = int(buffer.valid_masks.shape[-1])
+            b_valid_masks = buffer.valid_masks.reshape(batch_total, action_dim)
 
-        # Normalize advantages for stability
-        adv_mean = b_advantages.mean()
-        adv_std = b_advantages.std()
-        b_advantages = (b_advantages - adv_mean) / (adv_std + 1e-8)
+            # Normalize advantages for stability
+            adv_mean = b_advantages.mean()
+            adv_std = b_advantages.std()
+            b_advantages = (b_advantages - adv_mean) / (adv_std + 1e-8)
 
-        # Part 2: PPO epochs and minibatch optimization
-        model.train()
-        inds = torch.arange(batch_total, device=device)
+            # Part 2: PPO epochs and minibatch optimization
+            model.train()
+            inds = torch.arange(batch_total, device=device)
 
-        # Track averages for logging
-        total_policy_loss = 0.0
-        total_value_loss = 0.0
-        total_entropy = 0.0
-        total_loss = 0.0
-        minibatch_updates = 0
+            # Track averages for logging
+            total_policy_loss = 0.0
+            total_value_loss = 0.0
+            total_entropy = 0.0
+            total_loss = 0.0
+            minibatch_updates = 0
 
-        for epoch in range(PPO_EPOCHS):
-            # Shuffle indices each epoch to break temporal correlation
-            perm = inds[torch.randperm(batch_total, device=device)]
-            for start in range(0, batch_total, BATCH_SIZE):
-                end = min(start + BATCH_SIZE, batch_total)
-                mb_inds = perm[start:end]
+            for epoch in range(PPO_EPOCHS):
+                # Shuffle indices each epoch to break temporal correlation
+                perm = inds[torch.randperm(batch_total, device=device)]
+                for start in range(0, batch_total, BATCH_SIZE):
+                    end = min(start + BATCH_SIZE, batch_total)
+                    mb_inds = perm[start:end]
 
-                mb_spatial = b_spatial_obs[mb_inds]
-                mb_flat = b_flat_obs[mb_inds]
-                mb_actions = b_actions[mb_inds]
-                mb_old_logp = b_log_probs[mb_inds]
-                mb_adv = b_advantages[mb_inds]
-                mb_ret = b_returns[mb_inds]
-                mb_masks = b_valid_masks[mb_inds]
-                # Recompute candidate tensors for minibatch from stored board plane (ch 0) and piece ids
-                mb_piece_ids = buffer.piece_ids.reshape(batch_total)[mb_inds]
-                try:
-                    import numpy as _np
-                except Exception:
-                    _np = None
-                crs = []
-                cfs = []
-                for i in range(mb_spatial.size(0)):
-                    bp = mb_spatial[i, 0].detach().cpu().numpy(
-                    ) if _np is not None else mb_spatial[i, 0].detach().cpu().tolist()
-                    pid = int(mb_piece_ids[i].item())
-                    r_i, f_i, _ = build_candidate_tensors_from_board_plane(
-                        bp, pid, pad_to=vec_env.action_space_n)
-                    cr = torch.from_numpy(r_i) if _np is not None else torch.as_tensor(
-                        r_i, dtype=torch.float32)
-                    cf = torch.from_numpy(f_i) if _np is not None else torch.as_tensor(
-                        f_i, dtype=torch.float32)
-                    crs.append(cr)
-                    cfs.append(cf)
-                mb_cand_rasters = torch.stack(crs, dim=0).to(device)
-                mb_cand_feats = torch.stack(cfs, dim=0).to(device)
+                    mb_spatial = b_spatial_obs[mb_inds]
+                    mb_flat = b_flat_obs[mb_inds]
+                    mb_actions = b_actions[mb_inds]
+                    mb_old_logp = b_log_probs[mb_inds]
+                    mb_adv = b_advantages[mb_inds]
+                    mb_ret = b_returns[mb_inds]
+                    mb_masks = b_valid_masks[mb_inds]
+                    # Recompute candidate tensors for minibatch from stored board plane (ch 0) and piece ids
+                    mb_piece_ids = buffer.piece_ids.reshape(batch_total)[mb_inds]
+                    try:
+                        import numpy as _np
+                    except Exception:
+                        _np = None
+                    crs = []
+                    cfs = []
+                    for i in range(mb_spatial.size(0)):
+                        bp = mb_spatial[i, 0].detach().cpu().numpy(
+                        ) if _np is not None else mb_spatial[i, 0].detach().cpu().tolist()
+                        pid = int(mb_piece_ids[i].item())
+                        r_i, f_i, _ = build_candidate_tensors_from_board_plane(
+                            bp, pid, pad_to=vec_env.action_space_n)
+                        cr = torch.from_numpy(r_i) if _np is not None else torch.as_tensor(
+                            r_i, dtype=torch.float32)
+                        cf = torch.from_numpy(f_i) if _np is not None else torch.as_tensor(
+                            f_i, dtype=torch.float32)
+                        crs.append(cr)
+                        cfs.append(cf)
+                    mb_cand_rasters = torch.stack(crs, dim=0).to(device)
+                    mb_cand_feats = torch.stack(cfs, dim=0).to(device)
 
-                new_logits, new_values = model(
-                    (mb_spatial, mb_flat), cand_inputs=(mb_cand_rasters, mb_cand_feats))
-                # Apply categorical mask before distribution
-                new_logits = new_logits.masked_fill(~mb_masks, -torch.inf)
-                dist = Categorical(logits=new_logits)
-                new_logp = dist.log_prob(mb_actions)
-                entropy = dist.entropy().mean()
+                    new_logits, new_values = model(
+                        (mb_spatial, mb_flat), cand_inputs=(mb_cand_rasters, mb_cand_feats))
+                    # Apply categorical mask before distribution
+                    new_logits = new_logits.masked_fill(~mb_masks, -torch.inf)
+                    dist = Categorical(logits=new_logits)
+                    new_logp = dist.log_prob(mb_actions)
+                    entropy = dist.entropy().mean()
 
-                # Critic loss (value function)
-                value_loss = F.mse_loss(new_values.squeeze(-1), mb_ret)
+                    # Critic loss (value function)
+                    value_loss = F.mse_loss(new_values.squeeze(-1), mb_ret)
 
-                # Actor loss (PPO clipped surrogate)
-                ratio = torch.exp(new_logp - mb_old_logp)
-                surr1 = mb_adv * ratio
-                surr2 = mb_adv * \
-                    torch.clamp(ratio, 1.0 - CLIP_COEF, 1.0 + CLIP_COEF)
-                policy_loss = -torch.min(surr1, surr2).mean()
+                    # Actor loss (PPO clipped surrogate)
+                    ratio = torch.exp(new_logp - mb_old_logp)
+                    surr1 = mb_adv * ratio
+                    surr2 = mb_adv * \
+                        torch.clamp(ratio, 1.0 - CLIP_COEF, 1.0 + CLIP_COEF)
+                    policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Total loss
-                loss = policy_loss + VF_COEF * value_loss - ENT_COEF * entropy
+                    # Total loss
+                    loss = policy_loss + VF_COEF * value_loss - ENT_COEF * entropy
 
-                optimizer.zero_grad()
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                optimizer.step()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+                    optimizer.step()
 
-                # Accumulate logs
-                total_policy_loss += policy_loss.detach().item()
-                total_value_loss += value_loss.detach().item()
-                total_entropy += entropy.detach().item()
-                total_loss += loss.detach().item()
-                minibatch_updates += 1
+                    # Accumulate logs
+                    total_policy_loss += policy_loss.detach().item()
+                    total_value_loss += value_loss.detach().item()
+                    total_entropy += entropy.detach().item()
+                    total_loss += loss.detach().item()
+                    minibatch_updates += 1
 
             # Log averaged losses for this update
             if minibatch_updates > 0:
@@ -877,7 +934,8 @@ if __name__ == "__main__":
                     # Also log rolling episodic return mean if available
                     if recent_returns_window:
                         current_mean_last_100 = (
-                            sum(recent_returns_window) / max(1, len(recent_returns_window))
+                            sum(recent_returns_window) /
+                            max(1, len(recent_returns_window))
                         )
                         writer.add_scalar(
                             "charts/episodic_return_mean_last_100",
@@ -889,7 +947,8 @@ if __name__ == "__main__":
                             save_checkpoint(
                                 best_ckpt_path,
                                 tag="best",
-                                extra={"best_metric": best_metric, "update": update_idx},
+                                extra={"best_metric": best_metric,
+                                       "update": update_idx},
                             )
                 except Exception:
                     pass
@@ -904,7 +963,8 @@ if __name__ == "__main__":
         # Mark training as complete (normal termination)
         training_is_complete = True
     except KeyboardInterrupt:
-        print("\n[interrupt] Caught KeyboardInterrupt. Saving last checkpoint and closing...")
+        print(
+            "\n[interrupt] Caught KeyboardInterrupt. Saving last checkpoint and closing...")
         try:
             save_checkpoint(last_ckpt_path, tag="last_interrupt")
         except Exception:
@@ -975,6 +1035,21 @@ if __name__ == "__main__":
                         center=(surface.get_width() // 2, surface.get_height() // 2))
                     surface.blit(text_surface, text_rect)
 
+                    # Instructions
+                    font2 = pygame.font.Font(None, 28)
+                    tips = [
+                        "S: Save As (inference weights)",
+                        "B: Export copy of best_model.pt",
+                        "L: Export copy of last_model.pt",
+                        "ESC/Q: Close",
+                    ]
+                    y = text_rect.bottom + 20
+                    for tip in tips:
+                        ts = font2.render(tip, True, (230, 230, 230))
+                        tr = ts.get_rect(center=(surface.get_width() // 2, y))
+                        surface.blit(ts, tr)
+                        y += 28
+
                     pygame.display.flip()
 
                 running = True
@@ -983,6 +1058,52 @@ if __name__ == "__main__":
                     for event in pygame.event.get():
                         if event.type == pygame.QUIT:
                             running = False
+                        elif event.type == pygame.KEYDOWN:
+                            if event.key in (pygame.K_ESCAPE, pygame.K_q):
+                                running = False
+                            elif event.key == pygame.K_s:
+                                default_name = f"export-{timestamp}.pt"
+                                path = prompt_save_path(
+                                    default_name=default_name)
+                                if path:
+                                    export_inference_checkpoint(
+                                        path, tag="export_on_complete")
+                            elif event.key == pygame.K_b:
+                                try:
+                                    if os.path.exists(best_ckpt_path):
+                                        default_name = os.path.basename(
+                                            best_ckpt_path)
+                                        path = prompt_save_path(
+                                            default_name=default_name)
+                                        if path:
+                                            shutil.copyfile(
+                                                best_ckpt_path, path)
+                                            print(
+                                                f"[export] Copied best checkpoint -> {path}")
+                                    else:
+                                        print(
+                                            "[export] No best checkpoint found to export yet.")
+                                except Exception as e:
+                                    print(
+                                        f"[export] Failed to export best checkpoint: {e}")
+                            elif event.key == pygame.K_l:
+                                try:
+                                    if os.path.exists(last_ckpt_path):
+                                        default_name = os.path.basename(
+                                            last_ckpt_path)
+                                        path = prompt_save_path(
+                                            default_name=default_name)
+                                        if path:
+                                            shutil.copyfile(
+                                                last_ckpt_path, path)
+                                            print(
+                                                f"[export] Copied last checkpoint -> {path}")
+                                    else:
+                                        print(
+                                            "[export] No last checkpoint found to export yet.")
+                                except Exception as e:
+                                    print(
+                                        f"[export] Failed to export last checkpoint: {e}")
                     if clock is not None:
                         clock.tick(30)
 
