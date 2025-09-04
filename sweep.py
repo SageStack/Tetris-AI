@@ -27,6 +27,7 @@ import subprocess
 import sys
 from pathlib import Path
 from dotenv import load_dotenv
+load_dotenv()  # load variables from .env if present
 
 try:
     import optuna
@@ -38,13 +39,13 @@ except Exception as e:
     raise
 
 # Persistent storage configuration for scalable, parallel sweeps.
-# Set a PostgreSQL URL here (or via env VAR) to enable multi-machine workers.
+# Prefer DB_URL from environment/.env; fallback to OPTUNA_DB_URL for compatibility.
 # Example PostgreSQL URL:
 #   postgresql+psycopg2://USER:PASSWORD@HOST:5432/optuna
 # For quick local testing, you can switch to SQLite with:
 #   sqlite:///db.sqlite3
 # Note: SQLite is fine for a single machine; use PostgreSQL for true parallel, multi-host sweeps.
-DB_URL = "postgresql://PGUSER:PGPASSWORD@ep-cold-hall-a7lvj857-pooler.ap-southeast-2.aws.neon.tech/neondb?sslmode=require"
+DB_URL = os.environ.get("DB_URL") or os.environ.get("OPTUNA_DB_URL", "")
 
 
 def _parse_render_selector(args) -> callable:
@@ -289,7 +290,7 @@ def main():
     should_render = _parse_render_selector(args)
 
     # Optuna storage: prefer explicit DB via CLI or env, else local SQLite file for easy testing
-    # Priority: --storage > OPTUNA_DB_URL > local sqlite under runs/sweeps/<study>/study.db
+    # Priority: --storage > DB_URL/OPTUNA_DB_URL > local sqlite under runs/sweeps/<study>/study.db
     resolved_db_url = (args.storage or DB_URL).strip()
     if not resolved_db_url:
         try:
