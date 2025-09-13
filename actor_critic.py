@@ -15,7 +15,10 @@ class ActorCritic(nn.Module):
                Default flat_dim=52: next(5x7)=35, hold(7), can_hold(1), +9 scalars.
 
     Outputs
-    - logits:  Tensor of shape (N, action_space_n) – unnormalized action scores
+    - logits:  Tensor of shape (N, action_space_n) – unnormalized action scores.
+               When candidate inputs are supplied, these correspond to per-candidate
+               scores; otherwise the fallback policy head over the fixed action space
+               is used.
     - value:   Tensor of shape (N,) – state-value estimates
     """
 
@@ -25,7 +28,7 @@ class ActorCritic(nn.Module):
         self.in_channels = int(in_channels)
         self.flat_dim = int(flat_dim)
 
-        # CNN branch for spatial input (2, 20, 10)
+        # CNN branch for spatial input (C, 20, 10); default C=7
         self.cnn = nn.Sequential(
             nn.Conv2d(self.in_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.ReLU(inplace=True),
@@ -35,7 +38,7 @@ class ActorCritic(nn.Module):
         # After convs: (N, 64, 20, 10) => flattened size
         self._cnn_flat_dim = 64 * 20 * 10
 
-        # MLP branch for flat features (43)
+        # MLP branch for flat features (52)
         self.mlp_flat = nn.Sequential(
             nn.Linear(self.flat_dim, 64),
             nn.ReLU(inplace=True),
